@@ -134,6 +134,10 @@ VIEW_CONCURRENCY = 50
 # reaction rejected) hand the job to an unused account from the same channel.
 # This is what turns "some posts got half the package" into full delivery.
 AUTO_RETRY_SPARES = 3
+# Telegram displays up to 11 reaction types on a post. Every post should spread
+# across that range rather than piling everything onto two or three emojis.
+REACT_KINDS_MIN = 9
+REACT_KINDS_MAX = 11
 # A flood wait up to this many seconds is waited out and retried on the same
 # account; anything longer is handed to a spare instead.
 SHORT_FLOOD_WAIT = 20
@@ -2184,17 +2188,16 @@ def distribute_reactions(total: int, allowed=None) -> dict:
     pool = [e for e in sane_reaction_pool(allowed) if e] or REACTION_EMOJIS
     weights = [REACTION_EMOJIS_WEIGHTED.get(e, 6) for e in pool]
 
-    # How many DIFFERENT emojis to use. The old code always aimed for 8-11,
-    # which on a 23-reaction post produced eleven kinds with a tail of 1s —
-    # the single most obvious bot signature, because a real post with 23
-    # reactions has three or four kinds, not eleven.
+    # How many DIFFERENT emojis to use. Telegram shows at most 11 reaction
+    # types on a post, and the spread should fill that: 9-11 kinds on every
+    # post. Fewer than that (two emojis carrying 90 reactions between them)
+    # looks just as machine-made as the other extreme.
     #
-    # Rule of thumb from real channels: roughly one distinct reaction per five
-    # reactions received, capped low. 20 reactions -> ~4 kinds, 100 -> ~8.
+    # Bounded by the pool and by the total: 5 reactions cannot be spread over
+    # 11 emojis.
     cap = min(len(pool), total)
-    target = 1 + int(total ** 0.5 / 1.6)          # 20->3, 50->4, 100->7, 200->9
-    lo = max(1, min(2, cap))
-    hi = max(lo, min(target + random.randint(0, 1), cap, 9))
+    lo = max(1, min(REACT_KINDS_MIN, cap))
+    hi = max(lo, min(REACT_KINDS_MAX, cap))
     num_emojis = random.randint(lo, hi)
 
     selected, available, avail_w = [], list(pool), list(weights)
@@ -2223,8 +2226,12 @@ def distribute_reactions(total: int, allowed=None) -> dict:
         selected = top3 + selected[3:]
 
     counts, remaining = {}, total
-    # Front-loaded shares: one clear winner, a second, then a quick fall-off.
-    shares = [0.38, 0.24, 0.15, 0.10, 0.06] + [0.04] * max(0, len(selected) - 5)
+    # Front-loaded shares across up to 11 kinds: a clear winner, a strong
+    # second, then a steady fall-off to the singles at the end. This is the
+    # shape a real post has — not a flat spread, and not two emojis taking
+    # everything.
+    shares = ([0.26, 0.18, 0.13, 0.10, 0.08, 0.07, 0.05, 0.04, 0.035, 0.03,
+               0.025] + [0.02] * max(0, len(selected) - 11))
     for i, emoji in enumerate(selected):
         if remaining <= 0:
             break
@@ -2243,20 +2250,6 @@ def distribute_reactions(total: int, allowed=None) -> dict:
         first = next(iter(counts))
         counts[first] += remaining
 
-    # Kill the long tail of 1s. On a big post a row of five different emojis
-    # sitting at exactly 1 each is not what an audience does — it is what a
-    # distribution function does. Fold stragglers back into the leaders once
-    # the post is large enough that a lone reaction looks out of place.
-    if total >= 12:
-        keep_ones = 1 if total < 40 else 2
-        ones = [e for e, c in counts.items() if c == 1]
-        for emoji in ones[keep_ones:]:
-            del counts[emoji]
-            leaders = [e for e, c in counts.items() if c > 1]
-            if leaders:
-                counts[random.choice(leaders[:3])] += 1
-            elif counts:
-                counts[next(iter(counts))] += 1
     return counts
 
 

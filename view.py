@@ -1231,32 +1231,61 @@ async def join_extra_accounts(doc: dict, keys: List[str]) -> List[str]:
     return ok
 
 
-async def onboard_new_accounts(keys: List[str],
-                               notify: Optional[int] = None) -> dict:
-    """Walk brand-new accounts into every active client channel.
+async def join_sub_channel(client, sub: dict):
+    """Join one subscription's channel with whatever identifier it has.
 
-    Until now a freshly imported account sat idle: subscriptions carry a fixed
-    ``joined_accounts`` snapshot taken when the client was created, so an account
-    added afterwards was never a member of anything and never got picked for a
-    reaction, a view or a live. The fleet grew but the work stayed on the old
-    sessions.
-
-    This joins each new account to every active subscription's channel and adds
-    it to that subscription's joined_accounts, so the client's "joined accounts"
-    count goes up and the account starts being used from the next post onwards.
-
-    Slow on purpose: joins are the flood-sensitive call, and a new account that
-    joins 50 channels in a minute is the classic way to get one frozen.
+    A subscription can be missing channel_username (private link) or even
+    channel_id (older rows saved before the id was resolved), so try every
+    identifier rather than skipping the row — a skipped row is exactly why
+    accounts looked like they "did not join anything".
     """
-    keys = [k for k in keys if acc_client(k) and not is_frozen(k)]
-    stats = {"accounts": len(keys), "channels": 0, "joins": 0,
-             "already": 0, "failed": 0, "frozen": 0, "skipped": 0}
+    spec = sub.get("channel_username")
+    if spec:
+        return await client(JoinChannelRequest(spec))
+
+    link = sub.get("channel_link") or ""
+    ltype, target = parse_target(link)
+    if ltype == "private" and target:
+        return await client(ImportChatInviteRequest(target))
+    if ltype == "public" and target:
+        return await client(JoinChannelRequest(target))
+    if sub.get("channel_id"):
+        return await client(JoinChannelRequest(channel_peer(sub["channel_id"])))
+    raise ValueError("subscription has no usable channel identifier")
+
+
+async def onboard_new_accounts(keys: List[str],
+                               notify: Optional[int] = None,
+                               progress=None) -> dict:
+    """Walk accounts into every active client channel and grow the packages.
+
+    Subscriptions carry a fixed ``joined_accounts`` snapshot taken when the
+    client was created, so an account added afterwards was a member of nothing
+    and never got picked for a reaction, a view or a live: the fleet grew but
+    the work stayed on the same old sessions.
+
+    For every active subscription this joins each account that is not already
+    on the list, then writes the result back:
+
+      * ``joined_accounts`` gains the new keys, so they start being used from
+        the next post;
+      * ``accounts_count`` is raised to the new membership size, so a client
+        sitting at 158 who gains 50 accounts shows 208 — the number in the UI
+        follows what is really in the channel instead of the original order.
+
+    Joins are the flood-sensitive call, so they go one account at a time per
+    channel with a real pause between them.
+    """
+    keys = [k for k in dict.fromkeys(keys) if acc_client(k) and not is_frozen(k)]
+    stats = {"accounts": len(keys), "channels": 0, "done_channels": 0,
+             "joins": 0, "already": 0, "failed": 0, "frozen": 0, "skipped": 0,
+             "subs_grown": 0}
     if not keys:
         return stats
 
-    subs = await get_client_subscriptions(status="active")
     now = utcnow()
-    subs = [s for s in subs if s.get("expires_at") and s["expires_at"] > now]
+    subs = [s for s in await get_client_subscriptions(status="active")
+            if s.get("expires_at") and s["expires_at"] > now]
     stats["channels"] = len(subs)
     if not subs:
         return stats
@@ -1264,13 +1293,11 @@ async def onboard_new_accounts(keys: List[str],
     load = await account_load()
 
     for sub in subs:
-        spec = sub.get("channel_username")
         already_in = set(sub.get("joined_accounts", []) or [])
+        todo = [k for k in keys if k not in already_in]
         fresh: List[str] = []
 
-        for key in keys:
-            if key in already_in:
-                continue
+        for key in todo:
             if is_frozen(key):
                 stats["skipped"] += 1
                 continue
@@ -1279,34 +1306,31 @@ async def onboard_new_accounts(keys: List[str],
                 continue
             client = acc_client(key)
             if not client:
+                stats["skipped"] += 1
                 continue
             try:
-                if spec:
-                    await client(JoinChannelRequest(spec))
-                elif sub.get("channel_type") == "private":
-                    _, invite = parse_target(sub["channel_link"])
-                    await client(ImportChatInviteRequest(invite))
-                elif sub.get("channel_id"):
-                    await client(JoinChannelRequest(
-                        channel_peer(sub["channel_id"])))
-                else:
-                    stats["skipped"] += 1
-                    continue
+                await join_sub_channel(client, sub)
                 fresh.append(key)
                 load[key] = load.get(key, 0) + 1
                 stats["joins"] += 1
-                await log_activity(key, "AUTO_JOIN", sub["channel_link"],
-                                   "new account")
+                await log_activity(key, "AUTO_JOIN", sub["channel_link"], "joined")
             except UserAlreadyParticipantError:
+                # Already inside — still record it, that is the whole point:
+                # membership the subscription did not know about was invisible
+                # to every picker.
                 fresh.append(key)
                 load[key] = load.get(key, 0) + 1
                 stats["already"] += 1
+            except InviteRequestSentError:
+                stats["failed"] += 1
+                await log_activity(key, "AUTO_JOIN", sub["channel_link"],
+                                   "join request pending")
             except FloodWaitError as e:
                 stats["failed"] += 1
                 await log_activity(key, "AUTO_JOIN", sub["channel_link"],
                                    f"flood {e.seconds}s")
-                # A flood wait on joins applies to this account, not the
-                # channel — give it a rest and carry on with the others.
+                # The wait belongs to this account, not the channel. Sit out a
+                # short one, otherwise move on to the next account.
                 if e.seconds <= 60:
                     await asyncio.sleep(e.seconds)
             except Exception as e:
@@ -1315,41 +1339,126 @@ async def onboard_new_accounts(keys: List[str],
                     stats["frozen"] += 1
                 else:
                     stats["failed"] += 1
+                    logger.warning(f"onboard {key} -> "
+                                   f"{sub.get('channel_link')}: "
+                                   f"{type(e).__name__}: {str(e)[:80]}")
                 await log_activity(key, "AUTO_JOIN", sub["channel_link"],
                                    str(e)[:40])
-            await asyncio.sleep(random.uniform(1.2, 2.2))
+            await asyncio.sleep(random.uniform(1.0, 2.0))
 
         if fresh:
+            total_now = len(already_in | set(fresh))
             try:
                 await col_clients.update_one(
                     {"_id": sub["_id"]},
                     {"$addToSet": {"joined_accounts": {"$each": fresh}},
-                     "$set": {"updated_at": utcnow()}})
+                     # The package size follows the real membership: the client
+                     # bought N accounts and now has more, and every picker
+                     # reads accounts_count when deciding how many to use.
+                     "$set": {"accounts_count": total_now,
+                              "updated_at": utcnow()}})
+                stats["subs_grown"] += 1
+                logger.info(f"onboard: {sub.get('channel_link')} "
+                            f"{len(already_in)} -> {total_now} accounts "
+                            f"(+{len(fresh)})")
             except Exception as e:
                 logger.warning(f"onboard save failed for {sub.get('_id')}: {e}")
+
+        stats["done_channels"] += 1
+        if progress:
+            try:
+                await progress(stats, sub)
+            except Exception:
+                pass
 
     invalidate_peer_cache()
     await setup_channel_monitors()
     logger.info(
-        f"onboarding: {stats['accounts']} new account(s) -> "
+        f"onboarding: {stats['accounts']} account(s) -> "
         f"{stats['channels']} channel(s): {stats['joins']} joined, "
         f"{stats['already']} already in, {stats['failed']} failed, "
-        f"{stats['frozen']} frozen")
+        f"{stats['frozen']} frozen, {stats['subs_grown']} package(s) grown")
 
     if notify:
         try:
-            await bot.send_message(notify, card(E_CHECK, "New Accounts Onboarded", [
-                field(E_PERSON, "New accounts", str(stats["accounts"])),
-                field(E_CHANNEL, "Client channels", str(stats["channels"])),
-                "",
-                field(E_CHECK, "Joined", str(stats["joins"])),
-                field(E_YELLOW, "Already member", str(stats["already"])),
-                field(E_CROSS, "Failed", str(stats["failed"])),
-                field(E_WARN, "Frozen", str(stats["frozen"])),
-            ], footer=f"{E_SHIELD} {S('These accounts now count towards every client and will be used from the next post.')}"))
+            await bot.send_message(notify, onboard_report(stats))
         except Exception:
             pass
     return stats
+
+
+# One join-all at a time. Two overlapping runs would double every join request
+# per account, which is the fastest way to collect a flood wait on the fleet.
+_JOIN_ALL_RUNNING = False
+
+
+async def run_join_all(event, keys: List[str]):
+    """Owner-triggered: put every account into every active client channel."""
+    global _JOIN_ALL_RUNNING
+    if _JOIN_ALL_RUNNING:
+        try:
+            await event.respond(card(E_WARN, "Already Running", [
+                S("A join-all is already in progress. Wait for it to finish."),
+            ]))
+        except Exception:
+            pass
+        return
+    _JOIN_ALL_RUNNING = True
+    try:
+        try:
+            msg = await event.respond(card(E_ROCKET, "Join All Client Channels", [
+                field(E_PERSON, "Accounts", str(len(keys))),
+                "",
+                S("Starting..."),
+            ]))
+        except Exception:
+            msg = None
+        prog = Progress(msg) if msg is not None else None
+
+        async def on_channel(stats, sub):
+            if prog is None:
+                return
+            await prog.show(progress_card(
+                "Joining Client Channels",
+                stats["done_channels"], stats["channels"],
+                [field(E_CHECK, "New joins", str(stats["joins"])),
+                 field(E_YELLOW, "Already member", str(stats["already"])),
+                 field(E_CROSS, "Failed", str(stats["failed"]))],
+                detail=esc(str(sub.get("channel_link", ""))[:40])))
+
+        stats = await onboard_new_accounts(keys, progress=on_channel)
+        if prog is not None:
+            await prog.show(onboard_report(stats), force=True)
+            try:
+                await msg.edit(buttons=[[btn("Clients", "manage_clients", icon="📋"),
+                                         btn("Home", "home", icon="🏠")]])
+            except Exception:
+                pass
+    except Exception as e:
+        logger.error(f"join all: {e}", exc_info=True)
+        try:
+            await event.respond(card(E_CROSS, "Join All Failed", [
+                f"<code>{esc(str(e)[:200])}</code>",
+            ]))
+        except Exception:
+            pass
+    finally:
+        _JOIN_ALL_RUNNING = False
+
+
+def onboard_report(stats: dict, title: str = "Join All Complete") -> str:
+    return card(E_CHECK, title, [
+        field(E_PERSON, "Accounts used", str(stats.get("accounts", 0))),
+        field(E_CHANNEL, "Client channels", str(stats.get("channels", 0))),
+        "",
+        field(E_CHECK, "New joins", str(stats.get("joins", 0))),
+        field(E_YELLOW, "Already member", str(stats.get("already", 0))),
+        field(E_CROSS, "Failed", str(stats.get("failed", 0))),
+        field(E_LOCK, "Frozen skipped", str(stats.get("frozen", 0))),
+        field(E_WARN, "Skipped (full/offline)", str(stats.get("skipped", 0))),
+        "",
+        field(E_CHART, "Packages updated", str(stats.get("subs_grown", 0))),
+    ], footer=f"{E_SHIELD} {S('Client account counts now match real membership.')}")
 
 
 async def accounts_missing_from_subs() -> List[str]:
@@ -1365,8 +1474,13 @@ async def accounts_missing_from_subs() -> List[str]:
             if s.get("expires_at") and s["expires_at"] > now]
     if not subs:
         return []
+    load = await account_load()
     out = []
     for key in joinable_keys():
+        # An account already at Telegram's channel ceiling cannot take more, so
+        # listing it here would only produce failures on every sweep.
+        if load.get(key, 0) >= MAX_CHANNELS_PER_ACCOUNT:
+            continue
         for s in subs:
             if key not in (s.get("joined_accounts") or []):
                 out.append(key)
@@ -3459,6 +3573,7 @@ OWNER_ONLY = {
     "problem_sessions", "trash_menu", "trash_restore", "trash_clear_ask",
     "trash_clear_do", "scan_dead", "acc_stop_all_ask", "acc_stop_all_do",
     "acc_rm_dead_ask", "acc_rm_dead_do", "approve", "stats", "sync_onboard",
+    "join_all_clients", "join_all_do",
     "leave_all", "exec_leave_all",
     "go_live", "audio_menu", "audio_set", "audio_del", "live_stop_all",
     "live_now", "live_cap", "live_rot",
@@ -3772,7 +3887,7 @@ async def route_callback(event, uid, owner, data):
             S("Joining slowly to avoid flood limits. You will get a summary "
               "when it finishes."),
         ]), kb_nav("menu_accounts"))
-        asyncio.create_task(onboard_new_accounts(missing, notify=event.chat_id))
+        asyncio.create_task(run_join_all(event, missing))
         return
 
     if data == "reload_sessions":
@@ -3967,7 +4082,63 @@ async def route_callback(event, uid, owner, data):
             "",
             f"{DOT} <code>https://t.me/channel</code>",
             f"{DOT} <code>https://t.me/+inviteHash</code>",
-        ]), [[btn("Cancel", "home", icon="↩️")]])
+            "",
+            f"{E_ROCKET} {S('Or use the button below to put every account into every client channel at once.')}",
+        ]), [[btn("Join All Client Channels", "join_all_clients", icon="🌐")],
+             [btn("Cancel", "home", icon="↩️")]])
+
+    if data == "join_all_clients":
+        # Everything the fleet has, not just the newly imported ones: this is
+        # the "make membership match reality" button.
+        if acc_count() == 0:
+            return await event.answer("No accounts online", alert=True)
+        now = utcnow()
+        subs = [x for x in await get_client_subscriptions(status="active")
+                if x.get("expires_at") and x["expires_at"] > now]
+        if not subs:
+            return await safe_edit(event, card(E_WARN, "No Client Channels", [
+                S("There is no active client subscription to join."),
+            ]), kb_nav("home"))
+        keys = joinable_keys()
+        # How much work this actually is, so the confirm screen is honest.
+        pending = 0
+        for x in subs:
+            have = set(x.get("joined_accounts", []) or [])
+            pending += len([k for k in keys if k not in have])
+        task_states.pop(event.chat_id, None)
+        if pending == 0:
+            return await safe_edit(event, card(E_CHECK, "Already Joined", [
+                field(E_PERSON, "Accounts online", str(len(keys))),
+                field(E_CHANNEL, "Client channels", str(len(subs))),
+                "",
+                S("Every account is already in every active client channel."),
+            ]), kb_nav("home"))
+        mins = max(1, int(pending * 1.5 / 60))
+        return await safe_edit(event, card(E_ROCKET, "Join All Client Channels", [
+            field(E_PERSON, "Accounts", str(len(keys))),
+            field(E_CHANNEL, "Client channels", str(len(subs))),
+            field(E_CHART, "Joins to perform", str(pending)),
+            field(E_CLOCK, "Estimated time", f"~{mins} {S('min')}"),
+            "",
+            S("Every account joins every active client channel it is not "
+              "already in, and each client's account count is updated to the "
+              "real membership."),
+            "",
+            f"{E_SHIELD} {S('Joins are paced to avoid flood limits.')}",
+        ]), [[btn("Start Joining", "join_all_do", style="danger")],
+             [btn("Cancel", "home", icon="↩️")]])
+
+    if data == "join_all_do":
+        keys = joinable_keys()
+        if not keys:
+            return await event.answer("No usable account", alert=True)
+        await safe_edit(event, card(E_REFRESH, "Joining All Client Channels", [
+            field(E_PERSON, "Accounts", str(len(keys))),
+            "",
+            S("Working... progress updates below."),
+        ]))
+        asyncio.create_task(run_join_all(event, keys))
+        return
 
     if data in ("react_view", "multi_react"):
         if acc_count() == 0:

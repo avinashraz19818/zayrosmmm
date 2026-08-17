@@ -122,8 +122,21 @@ SESSION_LOCK_BACKOFF = 1.5
 
 # Bounded fan-out. Joins are the flood-sensitive operation, so they stay slow.
 JOIN_CONCURRENCY = 3
-REACT_CONCURRENCY = 20
+# Reactions and views on new posts share this budget across ALL posts in flight.
+# 20 was too tight: a channel firing four posts in a minute needs 4 x package
+# worth of calls, and at 20-at-a-time with a sleep inside each slot the later
+# posts were still being worked when the next burst arrived, so they ended up
+# short. Different accounts talking to Telegram in parallel is not itself
+# flood-sensitive — the per-account rate is, and that is paced separately.
+REACT_CONCURRENCY = 60
 VIEW_CONCURRENCY = 50
+# When an account fails to land a reaction/view (flood wait, unresolved peer,
+# reaction rejected) hand the job to an unused account from the same channel.
+# This is what turns "some posts got half the package" into full delivery.
+AUTO_RETRY_SPARES = 3
+# A flood wait up to this many seconds is waited out and retried on the same
+# account; anything longer is handed to a spare instead.
+SHORT_FLOOD_WAIT = 20
 # GetMessagesViewsRequest takes a list of ids — one call can cover many posts.
 VIEW_BATCH_SIZE = 100
 # Editing a progress message on every single operation is what earns the *bot*
@@ -1694,6 +1707,19 @@ async def send_reaction(client, peer, msg_id, emoji) -> Tuple[bool, Optional[str
         ))
         return True, None
     except FloodWaitError as e:
+        # A short wait belongs to this one account and is over in a moment;
+        # giving up on it meant the post quietly delivered fewer reactions than
+        # the client paid for. Sit it out once, then try again.
+        if e.seconds <= SHORT_FLOOD_WAIT:
+            await asyncio.sleep(e.seconds + 0.5)
+            try:
+                await client(SendReactionRequest(
+                    peer=peer, msg_id=msg_id,
+                    reaction=[ReactionEmoji(emoticon=emoji)],
+                ))
+                return True, None
+            except Exception as e2:
+                return False, f"after flood: {str(e2)[:40]}"
         return False, f"flood {e.seconds}s"
     except Exception as e:
         return False, str(e)[:60]
@@ -1712,6 +1738,16 @@ async def send_views(client, peer, msg_ids: List[int]) -> Tuple[bool, Optional[s
         ))
         return True, None
     except FloodWaitError as e:
+        if e.seconds <= SHORT_FLOOD_WAIT:
+            await asyncio.sleep(e.seconds + 0.5)
+            try:
+                await client(GetMessagesViewsRequest(
+                    peer=peer, id=list(msg_ids)[:VIEW_BATCH_SIZE],
+                    increment=True,
+                ))
+                return True, None
+            except Exception as e2:
+                return False, f"after flood: {str(e2)[:40]}"
         return False, f"flood {e.seconds}s"
     except Exception as e:
         return False, str(e)[:60]
@@ -2118,6 +2154,23 @@ REACTION_EMOJIS_WEIGHTED = {
 }
 REACTION_EMOJIS = list(REACTION_EMOJIS_WEIGHTED.keys())
 
+# A channel's allowed list is whatever the owner enabled, and that often
+# includes joke/seasonal reactions (🎅 🎄 🤡 💩 🙈 🦄 😶 …). Picking uniformly
+# from it is what produced the giveaway in the screenshot: a santa and a
+# unicorn sitting on a trading signal in August. Real audiences overwhelmingly
+# use a handful of positive reactions, so anything not in the weighted table is
+# only used as a last resort — and never as a lone 1-count tail entry.
+NATURAL_REACTIONS = set(REACTION_EMOJIS_WEIGHTED)
+
+
+def sane_reaction_pool(allowed: Optional[list]) -> list:
+    """Intersect the channel's allowed list with reactions a human would use."""
+    if not allowed:
+        return list(REACTION_EMOJIS)
+    natural = [e for e in allowed if e in NATURAL_REACTIONS]
+    # Some channels only enable oddball reactions; then we have no choice.
+    return natural or list(allowed)
+
 
 def distribute_reactions(total: int, allowed=None) -> dict:
     """Spread `total` reactions over several emojis in uneven amounts.
@@ -2128,12 +2181,20 @@ def distribute_reactions(total: int, allowed=None) -> dict:
     """
     if total <= 0:
         return {}
-    pool = [e for e in (allowed or REACTION_EMOJIS) if e] or REACTION_EMOJIS
-    weights = [REACTION_EMOJIS_WEIGHTED.get(e, 10) for e in pool]
+    pool = [e for e in sane_reaction_pool(allowed) if e] or REACTION_EMOJIS
+    weights = [REACTION_EMOJIS_WEIGHTED.get(e, 6) for e in pool]
 
+    # How many DIFFERENT emojis to use. The old code always aimed for 8-11,
+    # which on a 23-reaction post produced eleven kinds with a tail of 1s —
+    # the single most obvious bot signature, because a real post with 23
+    # reactions has three or four kinds, not eleven.
+    #
+    # Rule of thumb from real channels: roughly one distinct reaction per five
+    # reactions received, capped low. 20 reactions -> ~4 kinds, 100 -> ~8.
     cap = min(len(pool), total)
-    lo = max(1, min(8, cap))
-    hi = max(lo, min(11, cap))
+    target = 1 + int(total ** 0.5 / 1.6)          # 20->3, 50->4, 100->7, 200->9
+    lo = max(1, min(2, cap))
+    hi = max(lo, min(target + random.randint(0, 1), cap, 9))
     num_emojis = random.randint(lo, hi)
 
     selected, available, avail_w = [], list(pool), list(weights)
@@ -2162,11 +2223,12 @@ def distribute_reactions(total: int, allowed=None) -> dict:
         selected = top3 + selected[3:]
 
     counts, remaining = {}, total
-    shares = [0.30, 0.22, 0.15, 0.11, 0.08] + [0.05] * max(0, len(selected) - 5)
+    # Front-loaded shares: one clear winner, a second, then a quick fall-off.
+    shares = [0.38, 0.24, 0.15, 0.10, 0.06] + [0.04] * max(0, len(selected) - 5)
     for i, emoji in enumerate(selected):
         if remaining <= 0:
             break
-        share = shares[i] if i < len(shares) else 0.05
+        share = shares[i] if i < len(shares) else 0.04
         count = max(1, min(int(total * share * random.uniform(0.85, 1.15)), remaining))
         counts[emoji] = count
         remaining -= count
@@ -2180,6 +2242,21 @@ def distribute_reactions(total: int, allowed=None) -> dict:
     if remaining > 0 and counts:
         first = next(iter(counts))
         counts[first] += remaining
+
+    # Kill the long tail of 1s. On a big post a row of five different emojis
+    # sitting at exactly 1 each is not what an audience does — it is what a
+    # distribution function does. Fold stragglers back into the leaders once
+    # the post is large enough that a lone reaction looks out of place.
+    if total >= 12:
+        keep_ones = 1 if total < 40 else 2
+        ones = [e for e, c in counts.items() if c == 1]
+        for emoji in ones[keep_ones:]:
+            del counts[emoji]
+            leaders = [e for e, c in counts.items() if c > 1]
+            if leaders:
+                counts[random.choice(leaders[:3])] += 1
+            elif counts:
+                counts[next(iter(counts))] += 1
     return counts
 
 
@@ -2237,6 +2314,16 @@ async def process_new_post(channel_id: int, message_id: int):
             for k in react_keys:
                 ACC_INFLIGHT[k] = max(0, ACC_INFLIGHT.get(k, 1) - 1)
 
+        # Anyone not picked is a stand-in. When a chosen account fails — flood
+        # wait, peer not resolvable, reaction rejected — the work is handed to
+        # one of these instead of being silently dropped. Without this a burst
+        # of posts delivered whatever happened to succeed, which is why some
+        # posts in the same minute got the full package and others got half.
+        react_spares = [k for k in pick_workers(joined, len(joined))
+                        if k not in react_keys]
+        view_spares = [k for k in pick_workers(joined, len(joined))
+                       if k not in view_keys]
+
         # Use the shared global semaphore so all concurrent process_new_post
         # calls stay within REACT_CONCURRENCY total, not REACT_CONCURRENCY each.
         sem = _get_auto_react_sem()
@@ -2253,38 +2340,76 @@ async def process_new_post(channel_id: int, message_id: int):
                 emoji_plan.extend([emoji] * count)
             random.shuffle(emoji_plan)
 
-        async def react(key, emoji):
-            async with sem:
-                with working(key):
-                    client = acc_client(key)
-                    peer = await resolve_peer(key, client, spec)
-                    if peer is None:
-                        return
-                    await send_reaction(client, peer, message_id, emoji)
-                    await asyncio.sleep(random.uniform(0.1, 0.5))
+        done = {"react": 0, "view": 0}
+        spare_lock = asyncio.Lock()
 
-        async def view(key):
-            async with sem:  # same global sem covers views too
-                with working(key):
-                    client = acc_client(key)
-                    peer = await resolve_peer(key, client, spec)
-                    if peer is None:
-                        return
-                    await send_views(client, peer, [message_id])
-                    await asyncio.sleep(random.uniform(0.05, 0.3))
+        async def take_spare(pool: List[str]) -> Optional[str]:
+            async with spare_lock:
+                return pool.pop(0) if pool else None
+
+        async def deliver(kind: str, key: str, emoji: Optional[str],
+                          spares: List[str]):
+            """Land one reaction/view, moving to a spare account on failure."""
+            for _ in range(1 + AUTO_RETRY_SPARES):
+                if key is None:
+                    return
+                client = acc_client(key)
+                if client is None:
+                    key = await take_spare(spares)
+                    continue
+                async with sem:
+                    with working(key):
+                        peer = await resolve_peer(key, client, spec)
+                        if peer is not None:
+                            if kind == "react":
+                                ok, err = await send_reaction(client, peer,
+                                                              message_id, emoji)
+                            else:
+                                ok, err = await send_views(client, peer,
+                                                           [message_id])
+                        else:
+                            ok, err = False, "peer unresolved"
+                # Sleep outside the semaphore: holding a concurrency slot while
+                # doing nothing is what made a burst of posts crawl, and slow
+                # delivery is what left later posts short.
+                await asyncio.sleep(random.uniform(0.1, 0.5) if kind == "react"
+                                    else random.uniform(0.05, 0.3))
+                if ok:
+                    done[kind] += 1
+                    return
+                logger.debug(f"post {message_id}: {kind} via {key} failed "
+                             f"({err}) — trying a spare")
+                key = await take_spare(spares)
+            if key is None:
+                logger.debug(f"post {message_id}: no spare left for a {kind}")
 
         # Small random stagger per subscription so multiple subs on the same
         # post don't all start in the same millisecond.
         await asyncio.sleep(random.uniform(0.1, 1.0))
-        await asyncio.gather(*[react(k, e) for k, e in zip(react_keys, emoji_plan)],
-                             *[view(k) for k in view_keys],
-                             return_exceptions=True)
+        await asyncio.gather(
+            *[deliver("react", k, e, react_spares)
+              for k, e in zip(react_keys, emoji_plan)],
+            *[deliver("view", k, None, view_spares) for k in view_keys],
+            return_exceptions=True)
 
         await col_clients.update_one({"_id": sub["_id"]},
                                      {"$inc": {"total_posts_processed": 1}})
-        await increment_stats(reactions=len(react_keys), views=len(view_keys))
-        logger.info(f"post {message_id}: {len(react_keys)} reactions, "
-                    f"{len(view_keys)} views for {sub.get('client_name')}")
+        await increment_stats(reactions=done["react"], views=done["view"])
+        # Report what actually landed, not what was planned. The old line
+        # printed the plan, so a post that delivered half looked perfect in the
+        # log — which is why short deliveries went unnoticed.
+        short = []
+        if done["react"] < n_react:
+            short.append(f"reactions {done['react']}/{n_react}")
+        if done["view"] < n_views:
+            short.append(f"views {done['view']}/{n_views}")
+        if short:
+            logger.warning(f"post {message_id}: SHORT — {', '.join(short)} "
+                           f"for {sub.get('client_name')} "
+                           f"({len(joined)} accounts in channel)")
+        else:
+            logger.info(f"post {message_id}: {done['react']} reactions, "
+                        f"{done['view']} views for {sub.get('client_name')}")
 
 
 async def load_settings():
@@ -2826,16 +2951,54 @@ async def setup_channel_monitors():
         if cid is not None
     }
 
-    # Prefer accounts that joined a monitored channel; they are the ones that
-    # will actually receive the update.
-    candidates: List[str] = []
+    # Every monitored channel needs at least one listener that is actually a
+    # member of it, otherwise its posts are never seen at all.
+    #
+    # The old code built one flat list of members and took the first five. With
+    # many channels those five all came from the first couple of subscriptions,
+    # so every other channel had no listener: its posts arrived with no
+    # reactions or views whatsoever, or only got picked up minutes later by the
+    # next sweep. That is the "some posts got nothing" half of the problem.
+    #
+    # Instead, walk the channels and take one member from each in turn, so
+    # coverage spreads across subscriptions before depth is added anywhere.
+    wanted: set = set()
+    per_channel: List[List[str]] = []
     for s in subs:
-        for k in s.get("joined_accounts", []):
-            if acc_client(k) and k not in candidates:
-                candidates.append(k)
-    if not candidates:
-        candidates = acc_keys()
-    wanted = set(candidates[:MONITOR_CLIENTS])
+        members = [k for k in s.get("joined_accounts", []) if acc_client(k)]
+        if members:
+            per_channel.append(members)
+
+    round_no = 0
+    while per_channel:
+        progressed = False
+        for members in per_channel:
+            if round_no >= len(members):
+                continue
+            key = members[round_no]
+            if key not in wanted:
+                wanted.add(key)
+            progressed = True
+        if not progressed:
+            break
+        round_no += 1
+        # One listener per channel is enough for coverage; the extra rounds only
+        # add redundancy, so stop once the budget is spent — but never before
+        # every channel has had its first pick.
+        if round_no >= 1 and len(wanted) >= max(MONITOR_CLIENTS,
+                                                len(per_channel)):
+            break
+
+    if not wanted:
+        wanted = set(acc_keys()[:MONITOR_CLIENTS])
+
+    uncovered = [s.get("channel_link", "?") for s in subs
+                 if s.get("joined_accounts")
+                 and not (set(s["joined_accounts"]) & wanted)]
+    if uncovered:
+        logger.warning(f"{len(uncovered)} channel(s) have no online member to "
+                       f"listen with, posts there will be missed: "
+                       f"{', '.join(str(u)[:30] for u in uncovered[:5])}")
 
     for key in wanted - clients_with_monitor:
         client = acc_client(key)

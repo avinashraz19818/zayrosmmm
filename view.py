@@ -78,6 +78,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger("viewbot")
 
+# Telethon logs "Got difference for channel ... updates" at INFO for every
+# single update on every monitoring account. With a few dozen accounts sitting
+# in hundreds of channels this is thousands of useless lines a minute — it
+# buries the lines that actually matter (joins, flood waits, dead accounts) and
+# makes bot.log grow by hundreds of MB a day. Keep Telethon at WARNING; our own
+# "viewbot" logger stays at INFO.
+for _noisy in ("telethon", "telethon.client.updates", "telethon.network",
+               "telethon.network.mtprotosender", "pytgcalls", "ntgcalls",
+               "pymongo", "asyncio"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
 # ═══════════════════════ CONFIGURATION ═══════════════════════
 API_ID = 21538384
 API_HASH = "9b8e9b10a5c34b67054aceca02bf423e"
@@ -165,6 +176,12 @@ FD_HEADROOM = 200
 MAX_CHANNELS_PER_ACCOUNT = 450
 KEEP_ALIVE_INTERVAL = 300
 PER_PAGE = 8
+# When a new account is added (phone login, string session or ZIP import) walk
+# it into every active client channel in the background, and add it to those
+# subscriptions' joined_accounts. Without this a new account is a member of
+# nothing, so it never gets picked for a reaction, view or live and the client's
+# joined-accounts count never moves.
+AUTO_ONBOARD = True
 
 # Global semaphore shared across ALL auto-react/view tasks.
 # This prevents concurrent flood when many new posts arrive at the same time.
@@ -205,6 +222,13 @@ LIVE_SESSIONS: Dict[int, dict] = {}
 # leaning on the same sessions when many channels post at the same moment.
 ACC_LAST_USED: Dict[str, float] = {}
 ACC_INFLIGHT: Dict[str, int] = {}
+# account_key -> when Telegram last said this account is frozen. Frozen accounts
+# stay connected and stay in the folder, but they cannot join anything, so every
+# picker skips them until the cooldown lapses and we retry once.
+FROZEN_ACCOUNTS: Dict[str, float] = {}
+FROZEN_RETRY_AFTER = 6 * 3600
+# Last (channels, accounts) pair reported by setup_channel_monitors().
+_LAST_MONITOR_STATE: Optional[Tuple[int, int]] = None
 # str(peer) -> list of allowed emojis, or None when the channel allows any
 ALLOWED_REACTIONS_CACHE: Dict[str, Optional[list]] = {}
 # (account_key, peer_spec) -> resolved input entity
@@ -429,6 +453,25 @@ DEAD_ACCOUNT_MARKERS = (
 )
 
 
+FROZEN_ACCOUNT_MARKERS = (
+    "FROZEN_METHOD_INVALID", "FROZENMETHODINVALID",
+    "NOT AVAILABLE FOR FROZEN ACCOUNTS",
+)
+
+
+def is_frozen_account_error(err: Exception) -> bool:
+    """True when Telegram refused the call because the account is frozen.
+
+    A frozen account is still authorised — get_me() works, it stays connected —
+    but every join/invite method returns FrozenMethodInvalidError. Left in the
+    pool it is picked over and over and every Go Live / client join wastes a
+    slot on it, which is exactly what the log showed. Treat it as unusable for
+    membership work instead, without ever deleting the session.
+    """
+    msg = str(err).upper()
+    return any(m in msg for m in FROZEN_ACCOUNT_MARKERS)
+
+
 def is_dead_account_error(err: Exception) -> bool:
     """True only when Telegram itself says the account or key is gone.
 
@@ -498,6 +541,37 @@ def acc_count() -> int:
 def acc_client(key: str) -> Optional[TelegramClient]:
     a = ACCOUNTS.get(key)
     return a.client if a else None
+
+
+def mark_frozen(key: str):
+    """Remember that Telegram refused a membership call for this account."""
+    if key and key not in FROZEN_ACCOUNTS:
+        logger.warning(f"{key}: account is frozen — skipping it for joins "
+                       f"for the next {FROZEN_RETRY_AFTER // 3600}h")
+    if key:
+        FROZEN_ACCOUNTS[key] = time.monotonic()
+
+
+def is_frozen(key: str) -> bool:
+    """Is this account currently marked frozen (and still inside cooldown)?"""
+    ts = FROZEN_ACCOUNTS.get(key)
+    if ts is None:
+        return False
+    if time.monotonic() - ts > FROZEN_RETRY_AFTER:
+        # Freezes do get lifted. Let it back into the pool and find out.
+        FROZEN_ACCOUNTS.pop(key, None)
+        return False
+    return True
+
+
+def joinable_keys(keys: Optional[List[str]] = None) -> List[str]:
+    """Online accounts that can actually join something right now."""
+    pool = acc_keys() if keys is None else keys
+    return [k for k in pool if acc_client(k) and not is_frozen(k)]
+
+
+def joinable_count() -> int:
+    return len(joinable_keys())
 
 
 def meta_path(session_path: str) -> str:
@@ -1054,7 +1128,11 @@ async def pick_accounts(n: int) -> Tuple[List[str], Dict[str, int]]:
     user at 500 channels and refuses the join past it.
     """
     load = await account_load()
-    usable = [k for k in acc_keys() if load.get(k, 0) < MAX_CHANNELS_PER_ACCOUNT]
+    # Frozen accounts are skipped: they answer every join with
+    # FrozenMethodInvalidError, so handing them a slot means the client silently
+    # gets fewer members than the package promised.
+    usable = [k for k in joinable_keys()
+              if load.get(k, 0) < MAX_CHANNELS_PER_ACCOUNT]
     # Shuffle first so equally-loaded accounts do not always tie in the same
     # order, which would just recreate the front-of-the-list bias.
     random.shuffle(usable)
@@ -1120,7 +1198,7 @@ async def join_extra_accounts(doc: dict, keys: List[str]) -> List[str]:
     async def join_one(key):
         async with sem:
             client = acc_client(key)
-            if not client:
+            if not client or is_frozen(key):
                 return
             try:
                 if spec:
@@ -1135,6 +1213,8 @@ async def join_extra_accounts(doc: dict, keys: List[str]) -> List[str]:
             except UserAlreadyParticipantError:
                 ok.append(key)
             except Exception as e:
+                if is_frozen_account_error(e):
+                    mark_frozen(key)
                 await log_activity(key, "CLIENT_JOIN", doc["channel_link"],
                                    str(e)[:40])
             await asyncio.sleep(0.4)
@@ -1149,6 +1229,195 @@ async def join_extra_accounts(doc: dict, keys: List[str]) -> List[str]:
             logger.warning(f"top-up save failed for {doc.get('_id')}: {e}")
         invalidate_peer_cache()
     return ok
+
+
+async def onboard_new_accounts(keys: List[str],
+                               notify: Optional[int] = None) -> dict:
+    """Walk brand-new accounts into every active client channel.
+
+    Until now a freshly imported account sat idle: subscriptions carry a fixed
+    ``joined_accounts`` snapshot taken when the client was created, so an account
+    added afterwards was never a member of anything and never got picked for a
+    reaction, a view or a live. The fleet grew but the work stayed on the old
+    sessions.
+
+    This joins each new account to every active subscription's channel and adds
+    it to that subscription's joined_accounts, so the client's "joined accounts"
+    count goes up and the account starts being used from the next post onwards.
+
+    Slow on purpose: joins are the flood-sensitive call, and a new account that
+    joins 50 channels in a minute is the classic way to get one frozen.
+    """
+    keys = [k for k in keys if acc_client(k) and not is_frozen(k)]
+    stats = {"accounts": len(keys), "channels": 0, "joins": 0,
+             "already": 0, "failed": 0, "frozen": 0, "skipped": 0}
+    if not keys:
+        return stats
+
+    subs = await get_client_subscriptions(status="active")
+    now = utcnow()
+    subs = [s for s in subs if s.get("expires_at") and s["expires_at"] > now]
+    stats["channels"] = len(subs)
+    if not subs:
+        return stats
+
+    load = await account_load()
+
+    for sub in subs:
+        spec = sub.get("channel_username")
+        already_in = set(sub.get("joined_accounts", []) or [])
+        fresh: List[str] = []
+
+        for key in keys:
+            if key in already_in:
+                continue
+            if is_frozen(key):
+                stats["skipped"] += 1
+                continue
+            if load.get(key, 0) >= MAX_CHANNELS_PER_ACCOUNT:
+                stats["skipped"] += 1
+                continue
+            client = acc_client(key)
+            if not client:
+                continue
+            try:
+                if spec:
+                    await client(JoinChannelRequest(spec))
+                elif sub.get("channel_type") == "private":
+                    _, invite = parse_target(sub["channel_link"])
+                    await client(ImportChatInviteRequest(invite))
+                elif sub.get("channel_id"):
+                    await client(JoinChannelRequest(
+                        channel_peer(sub["channel_id"])))
+                else:
+                    stats["skipped"] += 1
+                    continue
+                fresh.append(key)
+                load[key] = load.get(key, 0) + 1
+                stats["joins"] += 1
+                await log_activity(key, "AUTO_JOIN", sub["channel_link"],
+                                   "new account")
+            except UserAlreadyParticipantError:
+                fresh.append(key)
+                load[key] = load.get(key, 0) + 1
+                stats["already"] += 1
+            except FloodWaitError as e:
+                stats["failed"] += 1
+                await log_activity(key, "AUTO_JOIN", sub["channel_link"],
+                                   f"flood {e.seconds}s")
+                # A flood wait on joins applies to this account, not the
+                # channel — give it a rest and carry on with the others.
+                if e.seconds <= 60:
+                    await asyncio.sleep(e.seconds)
+            except Exception as e:
+                if is_frozen_account_error(e):
+                    mark_frozen(key)
+                    stats["frozen"] += 1
+                else:
+                    stats["failed"] += 1
+                await log_activity(key, "AUTO_JOIN", sub["channel_link"],
+                                   str(e)[:40])
+            await asyncio.sleep(random.uniform(1.2, 2.2))
+
+        if fresh:
+            try:
+                await col_clients.update_one(
+                    {"_id": sub["_id"]},
+                    {"$addToSet": {"joined_accounts": {"$each": fresh}},
+                     "$set": {"updated_at": utcnow()}})
+            except Exception as e:
+                logger.warning(f"onboard save failed for {sub.get('_id')}: {e}")
+
+    invalidate_peer_cache()
+    await setup_channel_monitors()
+    logger.info(
+        f"onboarding: {stats['accounts']} new account(s) -> "
+        f"{stats['channels']} channel(s): {stats['joins']} joined, "
+        f"{stats['already']} already in, {stats['failed']} failed, "
+        f"{stats['frozen']} frozen")
+
+    if notify:
+        try:
+            await bot.send_message(notify, card(E_CHECK, "New Accounts Onboarded", [
+                field(E_PERSON, "New accounts", str(stats["accounts"])),
+                field(E_CHANNEL, "Client channels", str(stats["channels"])),
+                "",
+                field(E_CHECK, "Joined", str(stats["joins"])),
+                field(E_YELLOW, "Already member", str(stats["already"])),
+                field(E_CROSS, "Failed", str(stats["failed"])),
+                field(E_WARN, "Frozen", str(stats["frozen"])),
+            ], footer=f"{E_SHIELD} {S('These accounts now count towards every client and will be used from the next post.')}"))
+        except Exception:
+            pass
+    return stats
+
+
+async def accounts_missing_from_subs() -> List[str]:
+    """Online, non-frozen accounts that are not on every active subscription.
+
+    This is the safety net for the onboarding above: a ZIP imported while the
+    bot was busy, an account that hit a flood wait halfway through, or sessions
+    dropped into the folder by hand and picked up by Reload all end up here, and
+    the periodic sweep walks them in.
+    """
+    now = utcnow()
+    subs = [s for s in await get_client_subscriptions(status="active")
+            if s.get("expires_at") and s["expires_at"] > now]
+    if not subs:
+        return []
+    out = []
+    for key in joinable_keys():
+        for s in subs:
+            if key not in (s.get("joined_accounts") or []):
+                out.append(key)
+                break
+    return out
+
+
+async def onboard_sweep_task():
+    """Every so often, walk any account that is missing from a client channel in."""
+    while True:
+        await asyncio.sleep(900)
+        if not AUTO_ONBOARD:
+            continue
+        try:
+            missing = await accounts_missing_from_subs()
+            if missing:
+                logger.info(f"onboarding sweep: {len(missing)} account(s) "
+                            f"not yet in every client channel")
+                await onboard_new_accounts(missing)
+        except Exception as e:
+            logger.error(f"onboarding sweep: {e}")
+
+
+def schedule_onboarding(keys: List[str], notify: Optional[int] = None):
+    """Run onboarding in the background so the import UI stays responsive."""
+    keys = [k for k in dict.fromkeys(keys) if k]
+    if not keys or not AUTO_ONBOARD:
+        return
+    asyncio.create_task(onboard_new_accounts(keys, notify))
+
+
+def chats_from_join_result(res) -> list:
+    """Pull the chat list out of whatever a join/import call returned.
+
+    Older layers answered ImportChatInviteRequest with Updates (which has
+    .chats). Newer ones wrap it in ChatInviteJoinResultOk, whose .updates holds
+    the Updates object — reading res.chats there raised
+    "'ChatInviteJoinResultOk' object has no attribute 'chats'" and lost the join
+    even though the account was already inside the channel.
+    """
+    seen = []
+    node = res
+    for _ in range(4):
+        if node is None:
+            break
+        chats = getattr(node, "chats", None)
+        if chats:
+            seen = list(chats)
+            break
+        node = getattr(node, "updates", None)
+    return seen
 
 
 async def get_client_doc(client_id) -> Optional[dict]:
@@ -1342,7 +1611,11 @@ async def ensure_member(client, spec) -> bool:
         return True
     except UserAlreadyParticipantError:
         return True
-    except Exception:
+    except Exception as e:
+        if is_frozen_account_error(e):
+            # The key is not passed in here, so the caller's own handler records
+            # it; log it once so the reason is visible in bot.log.
+            logger.debug(f"ensure_member: frozen account refused {spec}")
         return False
 
 
@@ -1386,7 +1659,8 @@ def progress_card(title: str, done: int, total: int, stats: List[str],
 async def execute_join(event, state, limit):
     links = state["links_data"]
     delay = state.get("delay", 1)
-    keys = acc_keys()[:limit]
+    # Frozen accounts cannot join anything, so they never take a slot here.
+    keys = joinable_keys()[:limit]
     if not keys:
         return await event.respond(card(E_CROSS, "No Accounts", [S("Add accounts first.")]),
                                    buttons=kb_nav())
@@ -1434,6 +1708,8 @@ async def execute_join(event, state, limit):
                     counters["failed"] += 1
                     await log_activity(key, "JOIN", info["link"], f"flood {e.seconds}s")
             except Exception as e:
+                if is_frozen_account_error(e):
+                    mark_frozen(key)
                 counters["failed"] += 1
                 await log_activity(key, "JOIN", info["link"], str(e)[:40])
             counters["done"] += 1
@@ -1999,7 +2275,7 @@ def free_live_keys(keys: List[str], chat_id: Optional[int] = None) -> List[str]:
     """Those of `keys` that are online and not tied up in another call."""
     out = []
     for k in keys:
-        if not acc_client(k):
+        if not acc_client(k) or is_frozen(k):
             continue
         busy = live_busy_in(k)
         if busy is None or busy == chat_id:
@@ -2465,8 +2741,14 @@ async def setup_channel_monitors():
                 pass
         clients_with_monitor.discard(key)
 
-    logger.info(f"Monitoring {len(monitored_channels)} channel(s) via "
-                f"{len(clients_with_monitor)} account(s)")
+    # This runs every 5 minutes; only say something when it actually changed,
+    # otherwise the line just repeats forever in the log.
+    global _LAST_MONITOR_STATE
+    stateline = (len(monitored_channels), len(clients_with_monitor))
+    if stateline != _LAST_MONITOR_STATE:
+        _LAST_MONITOR_STATE = stateline
+        logger.info(f"Monitoring {len(monitored_channels)} channel(s) via "
+                    f"{len(clients_with_monitor)} account(s)")
 
 
 async def monitor_task():
@@ -2610,6 +2892,10 @@ async def scan_dead_accounts() -> List[str]:
             if is_dead_account_error(e):
                 ACCOUNTS[key].state = "dead"
                 dead_keys.append(key)
+            elif is_frozen_account_error(e):
+                # Frozen is not dead: the session is fine and must not be
+                # trashed, it just cannot join or invite anything.
+                mark_frozen(key)
             else:
                 logger.debug(f"scan {key}: {e}")
         await asyncio.sleep(0.2)
@@ -2625,6 +2911,8 @@ async def show_accounts_menu(event):
         field(E_PAGE, "Session files", str(files)),
         field(E_WARN, "Need review", str(len(PROBLEM_SESSIONS))),
         field(E_RED, "Detected dead", str(dead)),
+        field(E_LOCK, "Frozen (cannot join)", str(sum(1 for k in ACCOUNTS
+                                                      if is_frozen(k)))),
         field(E_TRASH, "In trash", str(len(trash_entries()))),
     ], footer=f"{E_SHIELD} {S('Removing an account moves it to trash, never deletes it')}")
     buttons = [
@@ -2638,6 +2926,7 @@ async def show_accounts_menu(event):
          btn("Trash", "trash_menu", icon="🗑")],
         [btn("Stop All Accounts", "acc_stop_all_ask", icon="⏸"),
          btn("Remove All Dead", "acc_rm_dead_ask", icon="🚫")],
+        [btn("Sync To Client Channels", "sync_onboard", icon="🔗")],
         [btn("Home", "home", icon="🏠")],
     ]
     await safe_edit(event, text, buttons)
@@ -2954,6 +3243,11 @@ async def show_client_detail(event, client_id):
         "",
         field(E_PERSON, "Accounts", f"{doc['accounts_count']} "
                                     f"({online} {S('online')})"),
+        # Members actually recorded on the channel — this is what grows when new
+        # accounts are imported and auto-joined, so it can exceed the package
+        # size the client originally bought.
+        field(E_CHECK, "Joined accounts",
+              str(len(doc.get("joined_accounts", []) or []))),
         field(E_THUMB, "Reactions / post", str(doc["reactions_per_post"])),
         field(E_EYE, "Views / post", str(doc["views_per_post"])),
         field(E_ROCKET, "Live stream accounts", str(doc.get("livestream_accounts", 0))),
@@ -3126,6 +3420,9 @@ async def cmd_reload(event):
                                     [S("Reading the sessions folder...")]))
     tally = await load_all_sessions()
     await setup_channel_monitors()
+    # Sessions dropped into the folder by hand are new accounts too — put them
+    # into the client channels instead of leaving them idle.
+    schedule_onboarding(await accounts_missing_from_subs(), notify=event.chat_id)
     await msg.edit(card(E_CHECK, "Reload Complete", [
         field(E_GREEN, "Online", str(acc_count())),
         field(E_RED, "Not authorised", str(tally["dead"])),
@@ -3161,7 +3458,7 @@ OWNER_ONLY = {
     "add_string", "import_zip", "remove_account", "reload_sessions",
     "problem_sessions", "trash_menu", "trash_restore", "trash_clear_ask",
     "trash_clear_do", "scan_dead", "acc_stop_all_ask", "acc_stop_all_do",
-    "acc_rm_dead_ask", "acc_rm_dead_do", "approve", "stats",
+    "acc_rm_dead_ask", "acc_rm_dead_do", "approve", "stats", "sync_onboard",
     "leave_all", "exec_leave_all",
     "go_live", "audio_menu", "audio_set", "audio_del", "live_stop_all",
     "live_now", "live_cap", "live_rot",
@@ -3456,11 +3753,35 @@ async def route_callback(event, uid, owner, data):
         await event.answer(f"Trashed {removed} dead account(s)")
         return await show_accounts_menu(event)
 
+    if data == "sync_onboard":
+        # Manual version of the automatic onboarding: join every online account
+        # to every active client channel it is not already in.
+        await safe_edit(event, card(E_REFRESH, "Syncing Accounts", [
+            S("Checking which accounts are missing from client channels..."),
+        ]))
+        missing = await accounts_missing_from_subs()
+        if not missing:
+            return await safe_edit(event, card(E_CHECK, "Already Synced", [
+                field(E_PERSON, "Accounts online", str(acc_count())),
+                "",
+                S("Every account is already in every active client channel."),
+            ]), kb_nav("menu_accounts"))
+        await safe_edit(event, card(E_REFRESH, "Syncing Accounts", [
+            field(E_PERSON, "Accounts to join", str(len(missing))),
+            "",
+            S("Joining slowly to avoid flood limits. You will get a summary "
+              "when it finishes."),
+        ]), kb_nav("menu_accounts"))
+        asyncio.create_task(onboard_new_accounts(missing, notify=event.chat_id))
+        return
+
     if data == "reload_sessions":
         await safe_edit(event, card(E_REFRESH, "Reloading",
                                     [S("Reading the sessions folder...")]))
         tally = await load_all_sessions()
         await setup_channel_monitors()
+        schedule_onboarding(await accounts_missing_from_subs(),
+                            notify=event.chat_id)
         return await safe_edit(event, card(E_CHECK, "Reload Complete", [
             field(E_GREEN, "Online", str(acc_count())),
             field(E_RED, "Not authorised", str(tally["dead"])),
@@ -4069,7 +4390,7 @@ async def apply_upgrade(event, state):
         # Least-busy first, same reason as pick_accounts(): acc_keys() order
         # would hand every upgrade the same front-of-the-list sessions.
         load = await account_load()
-        candidates = [k for k in acc_keys()
+        candidates = [k for k in joinable_keys()
                       if k not in joined
                       and load.get(k, 0) < MAX_CHANNELS_PER_ACCOUNT]
         random.shuffle(candidates)
@@ -4100,6 +4421,8 @@ async def apply_upgrade(event, state):
                     joined.append(key)
                     newly += 1
                 except Exception as e:
+                    if is_frozen_account_error(e):
+                        mark_frozen(key)
                     await log_activity(key, "CLIENT_JOIN", doc["channel_link"],
                                        str(e)[:40])
                 await asyncio.sleep(0.4)
@@ -4515,13 +4838,13 @@ async def flow_go_live(event, state, text):
             field(E_REFRESH, "Rotation", rotate_text()),
             "",
             f"{S('How many accounts should join the live stream?')} "
-            f"(1-{live_limit(acc_count())})",
+            f"(1-{live_limit(joinable_count())})",
         ]), buttons=[[btn("Cancel", "home", icon="↩️")]])
 
     if state["step"] == "count":
         if not text.isdigit() or int(text) < 1:
             return await bad(event, "Send a whole number.", "home")
-        n = live_limit(min(int(text), acc_count()))
+        n = live_limit(min(int(text), joinable_count()))
         task_states.pop(event.chat_id, None)
         return await execute_go_live(event, state, n)
 
@@ -4556,11 +4879,14 @@ async def execute_go_live(event, state, count):
     chat_id = None
     usable: List[str] = []
 
+    frozen_hit = 0
+
     for key in keys:
         client = acc_client(key)
-        if not client:
+        if not client or is_frozen(key):
             continue
         try:
+            ent = None
             if ltype == "public":
                 try:
                     await client(JoinChannelRequest(target))
@@ -4570,19 +4896,41 @@ async def execute_go_live(event, state, count):
             else:
                 try:
                     res = await client(ImportChatInviteRequest(target))
-                    ent = res.chats[0]
+                    chats = chats_from_join_result(res)
+                    ent = chats[0] if chats else None
                 except UserAlreadyParticipantError:
-                    ent = await client.get_entity(state["link"])
+                    ent = None
+                if ent is None:
+                    # Already a member, or the new ChatInviteJoinResult layer
+                    # gave us no chats — resolve it the normal way. Falling back
+                    # to a chat_id another account already found keeps the whole
+                    # batch from failing on one odd response.
+                    if chat_id is not None:
+                        ent = await client.get_entity(channel_peer(chat_id))
+                    else:
+                        ent = await client.get_entity(state["link"])
             chat_id = utils.get_peer_id(ent)
             usable.append(key)
         except Exception as e:
-            logger.warning(f"go live join {key}: {type(e).__name__}: {e}")
+            if is_frozen_account_error(e):
+                mark_frozen(key)
+                frozen_hit += 1
+            else:
+                logger.warning(f"go live join {key}: {type(e).__name__}: {e}")
         await asyncio.sleep(0.3)
 
+    if frozen_hit:
+        logger.warning(f"go live: {frozen_hit} frozen account(s) skipped")
+
     if chat_id is None or not usable:
-        return await msg.edit(card(E_CROSS, "Cannot Reach Channel", [
-            S("No account could join or resolve that channel."),
-        ]), buttons=kb_nav("home"))
+        lines = [S("No account could join or resolve that channel.")]
+        if frozen_hit:
+            lines += ["",
+                      field(E_WARN, "Frozen accounts", str(frozen_hit)),
+                      S("Those accounts are frozen by Telegram and cannot join "
+                        "anything. Add fresh accounts.")]
+        return await msg.edit(card(E_CROSS, "Cannot Reach Channel", lines),
+                              buttons=kb_nav("home"))
 
     call = await get_active_call(chat_id, usable)
     if call is None:
@@ -4735,10 +5083,15 @@ async def flow_login(event, state, text):
             ]), buttons=[[btn("Try Another", "add_string", icon="🔑")],
                          [btn("Back", "menu_accounts", icon="⬅️")]])
         await setup_channel_monitors()
+        # Put it into every active client channel so it starts earning straight
+        # away instead of sitting idle until the next subscription is created.
+        schedule_onboarding([acc.key], notify=chat_id)
         return await msg.edit(card(E_CHECK, "Account Added", [
             field(E_PHONE, "Account", esc(acc.label)),
             field(E_PERSON, "Name", esc(acc.name)),
             field(E_GREEN, "Total online", str(acc_count())),
+            "",
+            f"{E_REFRESH} {S('Joining it to all client channels in the background...')}",
         ]), buttons=add_another_kb("add_string"))
 
 
@@ -4775,12 +5128,19 @@ async def finish_login(event, state):
                     btn("Home", "home", icon="🏠")]]
     else:
         buttons = add_another_kb("add_phone")
-    await event.respond(card(E_CHECK, "Account Added", [
+    lines = [
         field(E_PHONE, "Number", esc(acc.phone)),
         field(E_PERSON, "Name", esc(acc.name)),
         field(E_GREEN, "Total online", str(acc_count())),
-    ], footer=f"{E_SHIELD} {S('Saved into the sessions folder.')}"),
-        buttons=buttons)
+    ]
+    # A re-login is an account the fleet already had, so it is already inside
+    # its channels; only a genuinely new login needs onboarding.
+    if not state.get("relogin_stem"):
+        schedule_onboarding([acc.key], notify=event.chat_id)
+        lines += ["", f"{E_REFRESH} {S('Joining it to all client channels in the background...')}"]
+    await event.respond(card(E_CHECK, "Account Added", lines,
+                             footer=f"{E_SHIELD} {S('Saved into the sessions folder.')}"),
+                        buttons=buttons)
 
 
 # ═══════════════════════ CREATE CLIENT FLOW ═══════════════════════
@@ -4820,15 +5180,17 @@ async def flow_create_client(event, state, text):
             "",
             field(E_GREEN, "Accounts online", str(acc_count())),
             "",
-            f"{S('How many accounts should join?')} (1-{acc_count()})",
+            f"{S('How many accounts should join?')} (1-{joinable_count()})",
         ]), buttons=[[btn("Cancel", "home", icon="↩️")]])
 
     if step == "accounts_count":
         if not text.isdigit():
             return await bad(event, "Numbers only.")
         n = int(text)
-        if n < 1 or n > acc_count():
-            return await bad(event, f"Enter between 1 and {acc_count()}.")
+        # Frozen accounts cannot join, so promising them to a client would
+        # under-deliver the package from day one.
+        if n < 1 or n > joinable_count():
+            return await bad(event, f"Enter between 1 and {joinable_count()}.")
         state["accounts_count"] = n
         state["step"] = "reactions"
         return await event.respond(card(E_THUMB, "Create Client", [
@@ -4940,7 +5302,7 @@ async def create_client_now(event, state):
                 else:
                     res = await client(ImportChatInviteRequest(target))
                 if channel_id is None:
-                    for chat in getattr(res, "chats", []) or []:
+                    for chat in chats_from_join_result(res):
                         channel_id = utils.get_peer_id(chat)
                         break
                 joined.append(key)
@@ -4951,6 +5313,8 @@ async def create_client_now(event, state):
                 await log_activity(key, "CLIENT_JOIN", state["channel_link"],
                                    f"flood {e.seconds}s")
             except Exception as e:
+                if is_frozen_account_error(e):
+                    mark_frozen(key)
                 await log_activity(key, "CLIENT_JOIN", state["channel_link"],
                                    str(e)[:40])
             if channel_id is None:
@@ -5088,6 +5452,7 @@ async def handle_zip_import(event):
 
         stats = {"alive": 0, "dead": 0, "unknown": 0, "no_meta": 0,
                  "desktop": 0, "android": 0}
+        new_keys: List[str] = []
 
         for i, src in enumerate(found, 1):
             stem = os.path.splitext(os.path.basename(src))[0]
@@ -5132,8 +5497,12 @@ async def handle_zip_import(event):
                        first_name=meta_get(meta, "first_name") or "",
                        phone=meta_get(meta, "phone") or "", **device)
 
-            state, _acc = await probe_and_register(dest)
-            stats[state] += 1
+            # NB: do not call this `state` — that name is the import flow's own
+            # variable and shadowing it here broke nothing yet only by luck.
+            res_state, _acc = await probe_and_register(dest)
+            stats[res_state] += 1
+            if res_state == "alive" and _acc and _acc.key:
+                new_keys.append(_acc.key)
             await asyncio.sleep(0.2)
             await prog.show(progress_card("Importing", i, len(found), [
                 field(E_GREEN, "Online", str(stats["alive"])),
@@ -5142,13 +5511,20 @@ async def handle_zip_import(event):
             ]))
 
         for s in strings:
-            if await import_string_session(s):
+            imported = await import_string_session(s)
+            if imported:
                 stats["alive"] += 1
+                if imported.key:
+                    new_keys.append(imported.key)
             else:
                 stats["dead"] += 1
             await asyncio.sleep(0.3)
 
         await setup_channel_monitors()
+        # Every account that came in from this ZIP now walks into all the
+        # active client channels, in the background, so the fleet that just grew
+        # is actually usable instead of idling until the next subscription.
+        schedule_onboarding(new_keys, notify=event.chat_id)
 
         lines = [
             field(E_GREEN, "Now online", str(stats["alive"])),
@@ -5220,6 +5596,7 @@ async def main():
     asyncio.create_task(reminder_task())
     asyncio.create_task(expiry_check_task())
     asyncio.create_task(keep_alive_task())
+    asyncio.create_task(onboard_sweep_task())
 
     if not TGCALLS_OK:
         print(f"  live audio   : UNAVAILABLE — {TGCALLS_ERR}")

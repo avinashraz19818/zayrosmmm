@@ -769,6 +769,59 @@ async def storage_delete(name: str) -> bool:
     return True
 
 
+async def delete_all_account_session_storage() -> dict:
+    """Delete all user-session objects in one MongoDB batch.
+
+    Moving one file at a time through GridFS requires a download, upload and
+    delete for every account. With 202 accounts that makes a callback appear
+    frozen and lets its query expire. This operation deletes the GridFS chunks,
+    files and manifests in bulk, then clears only stale client membership keys.
+    Client packages and subscriptions remain intact.
+    """
+    if mdb is None or col_storage is None or storage_lock is None:
+        return {"files": 0, "bytes": 0, "memberships": 0}
+
+    async with storage_lock:
+        docs = await col_storage.find({
+            "_id": {"$regex": r"^(sessions|trash)/"}
+        }, {"_id": 1, "gridfs_id": 1, "size": 1}).to_list(length=None)
+        ids = [d["gridfs_id"] for d in docs if d.get("gridfs_id")]
+        if ids:
+            # Delete chunks before file metadata. Both are MongoDB bulk calls,
+            # so the operation is seconds rather than one network round-trip
+            # per session.
+            await mdb[f"{GRIDFS_BUCKET}.chunks"].delete_many(
+                {"files_id": {"$in": ids}})
+            await mdb[f"{GRIDFS_BUCKET}.files"].delete_many(
+                {"_id": {"$in": ids}})
+        await col_storage.delete_many({
+            "_id": {"$regex": r"^(sessions|trash)/"}
+        })
+
+    # The local copy is disposable on Heroku; remove it too so a reload in the
+    # same dyno cannot show the deleted accounts.
+    for directory in (SESSIONS_DIR, TRASH_DIR):
+        for root, _dirs, filenames in os.walk(directory):
+            for filename in filenames:
+                if filename.endswith((".session", ".json", ".session-journal",
+                                      ".session-wal", ".session-shm")):
+                    try:
+                        os.unlink(os.path.join(root, filename))
+                    except FileNotFoundError:
+                        pass
+    _LOCAL_UPLOAD_FINGERPRINTS.clear()
+
+    membership_result = await col_clients.update_many(
+        {"joined_accounts": {"$exists": True}},
+        {"$set": {"joined_accounts": []}},
+    )
+    return {
+        "files": len(docs),
+        "bytes": sum(int(d.get("size", 0) or 0) for d in docs),
+        "memberships": membership_result.modified_count,
+    }
+
+
 async def storage_move(source_name: str, destination_name: str,
                        kind: str = "session") -> bool:
     data = await storage_get_bytes(source_name)
@@ -3675,7 +3728,7 @@ async def show_problem_sessions(event, page=1):
     # One bulk action prevents the owner from tapping dozens of callback buttons
     # at once. Each callback query is short-lived; the old per-row approach
     # expired while moving sessions to GridFS trash and produced QueryIdInvalid.
-    trash_buttons = [[btn("Move All to Trash", "prob_rm_all_ask", style="danger")]]
+    trash_buttons = [[btn("Delete All Sessions", "prob_rm_all_ask", style="danger")]]
     # Re-login + Trash per session so the owner can fix or clean each one
     for stem, _ in rows:
         trash_buttons.append([
@@ -4209,13 +4262,13 @@ async def route_callback(event, uid, owner, data):
     # ── Bulk remove problem sessions ──────────────────────────
     if data == "prob_rm_all_ask":
         count = len(PROBLEM_SESSIONS)
-        return await safe_edit(event, card(E_WARN, "Move All to Trash", [
+        return await safe_edit(event, card(E_WARN, "Delete All Sessions", [
             field(E_TRASH, "Problem sessions", str(count)),
             "",
-            S("Every session currently in Needs Review will be moved to MongoDB trash."),
-            S("Client subscriptions are not deleted."),
-            S("Use Accounts > Trash > Clear All only if permanent deletion is intended."),
-        ]), [[btn("Yes, move all", "prob_rm_all_do", style="danger"),
+            S("This permanently removes all user session files from MongoDB/GridFS."),
+            S("Clients, subscriptions, history and audio are preserved."),
+            S("New accounts must be added again with fresh OTP/2FA sessions."),
+        ]), [[btn("Yes, delete all", "prob_rm_all_do", style="danger"),
               btn("Cancel", "problem_sessions", icon="↩️")]])
 
     if data == "prob_rm_all_do":
@@ -4223,29 +4276,28 @@ async def route_callback(event, uid, owner, data):
         if _PROBLEM_PURGE_RUNNING:
             return await safe_callback_answer(event, "Bulk removal is already running")
         _PROBLEM_PURGE_RUNNING = True
-        # Acknowledge before the GridFS moves. A callback query expires quickly,
-        # so answering only after hundreds of file operations caused the noisy
-        # QueryIdInvalidError seen in the Heroku log.
-        await safe_callback_answer(event, "Removing all problem sessions...")
-        moved_files = 0
-        removed_entries = 0
+        # Acknowledge before the MongoDB bulk delete. It is fast, but the
+        # callback must still be answered before any network operation.
+        await safe_callback_answer(event, "Deleting all account sessions...")
         try:
-            for stem in list(PROBLEM_SESSIONS):
-                sess_path = os.path.join(SESSIONS_DIR, stem + ".session")
-                if os.path.exists(sess_path):
-                    moved_files += await to_trash(sess_path)
-                PROBLEM_SESSIONS.pop(stem, None)
-                removed_entries += 1
+            # Disconnect any account that survived the scan before deleting its
+            # local/remote session file.
+            for key in list(acc_keys()):
+                await disconnect_account(key)
+            result = await delete_all_account_session_storage()
+            PROBLEM_SESSIONS.clear()
+            ACCOUNTS.clear()
             invalidate_peer_cache()
             await setup_channel_monitors()
-            return await safe_edit(event, card(E_CHECK, "All Moved to Trash", [
-                field(E_TRASH, "Problem entries cleared", str(removed_entries)),
-                field(E_PAGE, "Files moved", str(moved_files)),
+            return await safe_edit(event, card(E_CHECK, "All Account Sessions Deleted", [
+                field(E_TRASH, "GridFS objects removed", str(result["files"])),
+                field(E_PAGE, "Data removed", f"{result['bytes'] / (1024 * 1024):.1f} MB"),
+                field(E_PERSON, "Client references cleared", str(result["memberships"])),
                 "",
-                S("The sessions will no longer be loaded as active accounts."),
-                S("Clients and subscriptions were preserved."),
+                S("Client packages and subscriptions were preserved."),
+                S("Add fresh accounts from Accounts > Add Account."),
             ]), [[btn("Accounts", "menu_accounts", icon="👤"),
-                   btn("Trash", "trash_menu", icon="🗑")],
+                   btn("Clients", "manage_clients", icon="📋")],
                   [btn("Home", "home", icon="🏠")]])
         finally:
             _PROBLEM_PURGE_RUNNING = False

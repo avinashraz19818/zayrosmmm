@@ -550,7 +550,29 @@ def is_dead_account_error(err: Exception) -> bool:
 
 
 # ═══════════════════════ MONGODB / GRIDFS STORAGE ═══════════════════════
-try:
+# Motor clients and asyncio primitives must be created inside the same event
+# loop that uses them. Creating AsyncIOMotorClient at module import and then
+# entering asyncio.run(main()) gives Heroku's worker the classic
+# "Future attached to a different loop" failure. Keep these globals lazy and
+# initialise them from main() after the running loop exists.
+mongo_client = None
+mdb = None
+col_history = None
+col_approved = None
+col_clients = None
+col_stats = None
+col_settings = None
+storage_bucket = None
+col_storage = None
+storage_lock = None
+
+
+def initialize_mongo_client():
+    """Create Motor/GridFS objects on the current event loop."""
+    global mongo_client, mdb, col_history, col_approved, col_clients
+    global col_stats, col_settings, storage_bucket, col_storage, storage_lock
+    if mongo_client is not None:
+        return
     mongo_client = AsyncIOMotorClient(
         MONGO_URI,
         serverSelectionTimeoutMS=20000,
@@ -571,15 +593,6 @@ try:
     col_storage = mdb["storage_manifest"]
     storage_lock = asyncio.Lock()
     logger.info("MongoDB/GridFS client created")
-except Exception as e:
-    logger.error(f"MongoDB error: {e}")
-    # Keep import-time errors visible without killing tooling such as py_compile;
-    # main() performs the real connection check and exits cleanly.
-    mongo_client = None
-    mdb = None
-    storage_bucket = None
-    col_storage = None
-    storage_lock = asyncio.Lock()
 
 
 _LOCAL_UPLOAD_FINGERPRINTS: Dict[str, Tuple[int, int]] = {}
@@ -6306,11 +6319,8 @@ async def main():
         print("  configuration: missing " + ", ".join(CONFIG_MISSING))
         print("  Set Heroku Config Vars; secrets are intentionally not in view.py.")
         return
-    if mongo_client is None or mdb is None:
-        print("  mongodb      : client could not be created")
-        return
-
     try:
+        initialize_mongo_client()
         await mongo_client.admin.command("ping")
         await ensure_database_indexes()
         # First import an existing VPS copy only when MongoDB does not already

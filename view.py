@@ -38,6 +38,7 @@ from telethon.errors import (
     UserAlreadyParticipantError,
     InviteRequestSentError,
     MessageNotModifiedError,
+    QueryIdInvalidError,
 )
 from telethon.tl.functions.messages import (
     ImportChatInviteRequest,
@@ -930,6 +931,7 @@ class Account:
 ACCOUNTS: Dict[str, Account] = {}
 # Sessions the folder holds that would not authorise. Never auto-deleted.
 PROBLEM_SESSIONS: Dict[str, str] = {}
+_PROBLEM_PURGE_RUNNING = False
 
 
 def acc_keys() -> List[str]:
@@ -3492,6 +3494,16 @@ async def expiry_check_task():
 
 
 # ═══════════════════════ SCREENS ═══════════════════════
+async def safe_callback_answer(event, text="", alert=False):
+    """Answer a callback if it is still fresh; expired taps are harmless."""
+    try:
+        await event.answer(text, alert=alert)
+    except QueryIdInvalidError:
+        logger.debug("callback query expired while answering: %s", text)
+    except Exception as exc:
+        logger.debug("callback answer failed: %s", exc)
+
+
 async def safe_edit(event, text, buttons=None):
     try:
         await event.edit(text, buttons=buttons)
@@ -3660,8 +3672,11 @@ async def show_problem_sessions(event, page=1):
         f"{E_LOCK} {S('Re-login sends a fresh OTP and replaces the session file.')} "
         f"{E_TRASH} {S('Trash moves it to the trash folder instead.')} "
         f"{S('A locked file usually means a second bot process is running.')}"))
+    # One bulk action prevents the owner from tapping dozens of callback buttons
+    # at once. Each callback query is short-lived; the old per-row approach
+    # expired while moving sessions to GridFS trash and produced QueryIdInvalid.
+    trash_buttons = [[btn("Move All to Trash", "prob_rm_all_ask", style="danger")]]
     # Re-login + Trash per session so the owner can fix or clean each one
-    trash_buttons = []
     for stem, _ in rows:
         trash_buttons.append([
             Button.inline(f"🔑 {esc(stem[:12])}", f"prob_login_{stem}".encode()),
@@ -4191,18 +4206,62 @@ async def route_callback(event, uid, owner, data):
     if data.startswith("prob_login_"):
         return await start_relogin(event, data[len("prob_login_"):])
 
+    # ── Bulk remove problem sessions ──────────────────────────
+    if data == "prob_rm_all_ask":
+        count = len(PROBLEM_SESSIONS)
+        return await safe_edit(event, card(E_WARN, "Move All to Trash", [
+            field(E_TRASH, "Problem sessions", str(count)),
+            "",
+            S("Every session currently in Needs Review will be moved to MongoDB trash."),
+            S("Client subscriptions are not deleted."),
+            S("Use Accounts > Trash > Clear All only if permanent deletion is intended."),
+        ]), [[btn("Yes, move all", "prob_rm_all_do", style="danger"),
+              btn("Cancel", "problem_sessions", icon="↩️")]])
+
+    if data == "prob_rm_all_do":
+        global _PROBLEM_PURGE_RUNNING
+        if _PROBLEM_PURGE_RUNNING:
+            return await safe_callback_answer(event, "Bulk removal is already running")
+        _PROBLEM_PURGE_RUNNING = True
+        # Acknowledge before the GridFS moves. A callback query expires quickly,
+        # so answering only after hundreds of file operations caused the noisy
+        # QueryIdInvalidError seen in the Heroku log.
+        await safe_callback_answer(event, "Removing all problem sessions...")
+        moved_files = 0
+        removed_entries = 0
+        try:
+            for stem in list(PROBLEM_SESSIONS):
+                sess_path = os.path.join(SESSIONS_DIR, stem + ".session")
+                if os.path.exists(sess_path):
+                    moved_files += await to_trash(sess_path)
+                PROBLEM_SESSIONS.pop(stem, None)
+                removed_entries += 1
+            invalidate_peer_cache()
+            await setup_channel_monitors()
+            return await safe_edit(event, card(E_CHECK, "All Moved to Trash", [
+                field(E_TRASH, "Problem entries cleared", str(removed_entries)),
+                field(E_PAGE, "Files moved", str(moved_files)),
+                "",
+                S("The sessions will no longer be loaded as active accounts."),
+                S("Clients and subscriptions were preserved."),
+            ]), [[btn("Accounts", "menu_accounts", icon="👤"),
+                   btn("Trash", "trash_menu", icon="🗑")],
+                  [btn("Home", "home", icon="🏠")]])
+        finally:
+            _PROBLEM_PURGE_RUNNING = False
+
     # ── Remove a single problem session ───────────────────────
     if data.startswith("prob_rm_"):
         stem = data[len("prob_rm_"):]
-        reason = PROBLEM_SESSIONS.get(stem, "unknown")
         sess_path = os.path.join(SESSIONS_DIR, stem + ".session")
+        await safe_callback_answer(event, "Removing...")
         if os.path.exists(sess_path):
             moved = await to_trash(sess_path)
             PROBLEM_SESSIONS.pop(stem, None)
-            await event.answer(f"Moved to trash ({moved} file(s))")
+            logger.info("Moved %s to trash (%s file(s))", stem, moved)
         else:
             PROBLEM_SESSIONS.pop(stem, None)
-            await event.answer("Entry cleared (file not found)")
+            logger.info("Cleared missing problem session %s", stem)
         return await show_problem_sessions(event, 1)
 
     # ── Per-account management ────────────────────────────────

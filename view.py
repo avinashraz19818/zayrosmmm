@@ -3125,7 +3125,12 @@ async def stop_live_audio(key: str, chat_id: int):
     call = TGCALLS.get(key)
     if call is not None:
         try:
-            await call.leave_call(chat_id)
+            # The group call can disappear remotely before our keepalive sees
+            # it. Do not call native leave_call() for an already-removed call;
+            # ntgcalls prints "Call not found" and needlessly races cleanup.
+            active = await call.calls
+            if chat_id in active:
+                await call.leave_call(chat_id)
         except Exception as e:
             logger.debug(f"leave call {key}: {e}")
     LIVE_AUDIO.get(chat_id, set()).discard(key)
@@ -3353,8 +3358,13 @@ async def live_keepalive_task():
         for chat_id, keys in list(LIVE_AUDIO.items()):
             call_live = await get_active_call(chat_id, list(keys))
             if call_live is None:
+                # Telegram has already removed the native call. Only clear our
+                # local bookkeeping; calling leave_call() here produces a
+                # native "Call not found, already removed" warning for every
+                # participant.
                 for key in list(keys):
-                    await stop_live_audio(key, chat_id)
+                    LIVE_AUDIO.get(chat_id, set()).discard(key)
+                    LIVE_SESSIONS.get(chat_id, {}).get("since", {}).pop(key, None)
                 end_live_session(chat_id)
                 logger.info(f"live stream ended in {chat_id} — accounts left")
                 continue

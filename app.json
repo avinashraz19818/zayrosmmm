@@ -1,0 +1,54 @@
+{
+  "name": "zayros-smm-bot",
+  "description": "Telegram account manager with MongoDB/GridFS persistence",
+  "repository": "https://github.com/avinashraz19818/zayrosmmm",
+  "keywords": ["telegram", "telethon", "mongodb", "gridfs", "heroku"],
+  "buildpacks": [
+    {
+      "url": "https://github.com/heroku/heroku-buildpack-apt"
+    },
+    {
+      "url": "heroku/python"
+    }
+  ],
+  "formation": {
+    "worker": {
+      "quantity": 1,
+      "size": "basic"
+    }
+  },
+  "env": {
+    "API_ID": {
+      "description": "Telegram API ID from my.telegram.org",
+      "required": true
+    },
+    "API_HASH": {
+      "description": "Telegram API hash from my.telegram.org",
+      "required": true
+    },
+    "BOT_TOKEN": {
+      "description": "BotFather token",
+      "required": true
+    },
+    "MONGO_URI": {
+      "description": "Existing MongoDB Atlas connection string",
+      "required": true
+    },
+    "OWNER_IDS": {
+      "description": "Comma-separated Telegram owner user IDs",
+      "required": true
+    },
+    "MONGO_DB_NAME": {
+      "description": "Existing MongoDB database name",
+      "value": "tg_manager_bot"
+    },
+    "MONGO_GRIDFS_BUCKET": {
+      "description": "GridFS bucket for sessions, bot session and audio",
+      "value": "tg_manager_storage"
+    },
+    "STORAGE_SYNC_INTERVAL": {
+      "description": "Runtime session sync interval in seconds",
+      "value": "120"
+    }
+  }
+}

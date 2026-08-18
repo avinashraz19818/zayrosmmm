@@ -31,7 +31,7 @@ from math import ceil
 from typing import Dict, List, Optional, Tuple
 
 from telethon import TelegramClient, events, Button, utils
-from telethon.sessions import StringSession
+from telethon.sessions import StringSession, SQLiteSession
 from telethon.errors import (
     SessionPasswordNeededError,
     FloodWaitError,
@@ -4041,6 +4041,28 @@ bot = TelegramClient(BOT_SESSION_BASE, API_ID or 1,
 bot.parse_mode = "html"
 
 
+def reload_bot_session_from_disk():
+    """Reopen the restored bot SQLite file before Telegram connects.
+
+    TelegramClient constructs SQLiteSession at import time. On a fresh Heroku
+    dyno that creates an empty local file, and restore_runtime_storage() later
+    replaces it with the GridFS copy. Reopening the session here avoids keeping
+    a connection to the unlinked empty inode, which SQLite reports as
+    ``attempt to write a readonly database``.
+    """
+    old_session = bot.session
+    try:
+        old_session.close()
+    except Exception:
+        pass
+    fresh_session = SQLiteSession(BOT_SESSION_BASE)
+    bot.session = fresh_session
+    # TelegramClient created its sender alongside the old session. Point both
+    # the sender and its MTProto state at the restored auth key as well.
+    bot._sender.auth_key = fresh_session.auth_key
+    bot._sender._state.auth_key = fresh_session.auth_key
+
+
 @bot.on(events.NewMessage(pattern=r"^/start"))
 async def cmd_start(event):
     task_states.pop(event.chat_id, None)
@@ -6328,6 +6350,7 @@ async def main():
         # the same code safe for both the one-time migration and every restart.
         await migrate_legacy_storage_if_needed()
         await restore_runtime_storage()
+        reload_bot_session_from_disk()
         print("  mongodb      : connected (clients + GridFS runtime storage)")
     except Exception as exc:
         print(f"  mongodb      : FAILED - {exc}")

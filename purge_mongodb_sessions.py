@@ -67,9 +67,18 @@ def main() -> None:
                 print(f"GridFS delete warning for {file_doc._id}: {exc}")
 
         result = manifest.delete_many({"_id": {"$regex": r"^(sessions|trash|bot)/"}})
+        # The session keys are no longer valid after the purge. Clear only the
+        # membership references; package limits, prices, expiry and every other
+        # client field remain untouched. New accounts can then be onboarded
+        # without old invalid keys inflating the joined_accounts list.
+        membership_result = db["clients"].update_many(
+            {"joined_accounts": {"$exists": True}},
+            {"$set": {"joined_accounts": []}},
+        )
         print(f"Deleted GridFS objects: {len(deleted_files)}")
         print(f"Deleted manifests: {result.deleted_count}")
-        print("Account session purge complete.")
+        print(f"Cleared client membership references: {membership_result.modified_count}")
+        print("Account session purge complete; client packages were preserved.")
     finally:
         client.close()
 

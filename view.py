@@ -31,7 +31,7 @@ from math import ceil
 from typing import Dict, List, Optional, Tuple
 
 from telethon import TelegramClient, events, Button, utils
-from telethon.sessions import StringSession, SQLiteSession
+from telethon.sessions import StringSession, MemorySession
 from telethon.errors import (
     SessionPasswordNeededError,
     FloodWaitError,
@@ -4031,36 +4031,16 @@ async def show_help(event):
 
 
 # ═══════════════════════ BOT ═══════════════════════
-# bot_session.session is also restored from/persisted to GridFS. Only the local
-# working path is passed to Telethon.
+# The bot account is authenticated by BOT_TOKEN, so it does not need a local
+# SQLite file. A MemorySession prevents Telethon from opening
+# bot_session.session during module import and then colliding with the GridFS
+# restore on Heroku. User-account sessions remain fully persistent in MongoDB.
 # Telethon validates api_id/hash at client construction time. Use harmless
 # placeholders only so static tooling can import this module without env vars;
 # main() refuses to start until the real Config Vars are present.
-bot = TelegramClient(BOT_SESSION_BASE, API_ID or 1,
+bot = TelegramClient(MemorySession(), API_ID or 1,
                      API_HASH or "missing-api-hash")
 bot.parse_mode = "html"
-
-
-def reload_bot_session_from_disk():
-    """Reopen the restored bot SQLite file before Telegram connects.
-
-    TelegramClient constructs SQLiteSession at import time. On a fresh Heroku
-    dyno that creates an empty local file, and restore_runtime_storage() later
-    replaces it with the GridFS copy. Reopening the session here avoids keeping
-    a connection to the unlinked empty inode, which SQLite reports as
-    ``attempt to write a readonly database``.
-    """
-    old_session = bot.session
-    try:
-        old_session.close()
-    except Exception:
-        pass
-    fresh_session = SQLiteSession(BOT_SESSION_BASE)
-    bot.session = fresh_session
-    # TelegramClient created its sender alongside the old session. Point both
-    # the sender and its MTProto state at the restored auth key as well.
-    bot._sender.auth_key = fresh_session.auth_key
-    bot._sender._state.auth_key = fresh_session.auth_key
 
 
 @bot.on(events.NewMessage(pattern=r"^/start"))
@@ -6350,7 +6330,6 @@ async def main():
         # the same code safe for both the one-time migration and every restart.
         await migrate_legacy_storage_if_needed()
         await restore_runtime_storage()
-        reload_bot_session_from_disk()
         print("  mongodb      : connected (clients + GridFS runtime storage)")
     except Exception as exc:
         print(f"  mongodb      : FAILED - {exc}")

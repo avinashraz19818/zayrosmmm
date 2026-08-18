@@ -127,6 +127,23 @@ restarts a crashed worker, then the boot restore loads the same MongoDB data.
 The `start` file is a VPS helper that expects `.venv` and backgrounds a process;
 it is intentionally not used by Heroku. Heroku uses `Procfile`.
 
+## Purging account sessions after a duplicate-IP incident
+
+Never run the old VPS worker and the Heroku worker with the same Telegram
+sessions. If Telegram has invalidated those auth keys and you want a clean
+Heroku start, scale the worker down, deploy this repository version, and run:
+
+```bash
+heroku ps:scale worker=0 -a YOUR-APP-NAME
+heroku run python purge_mongodb_sessions.py --yes -a YOUR-APP-NAME
+```
+
+That command removes only `sessions/`, `trash/` and the old `bot/` GridFS
+objects. It preserves clients, subscriptions, approvals, history, statistics,
+settings and `audio/live.mp3`. Add new accounts later through the bot's normal
+login/import flow. Do not use the bot UI's many `prob_rm_*` buttons at once;
+callback queries expire and are not a bulk-delete mechanism.
+
 ## 5. First-boot checks
 
 In the logs, confirm these lines (wording may include timestamps):

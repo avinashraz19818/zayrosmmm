@@ -1,0 +1,32 @@
+#!/bin/bash
+
+SCRIPT_NAME="view.py"
+PID_FILE=".bot.pid"
+
+echo "==> Activating virtual environment..."
+source .venv/bin/activate
+
+echo "==> Installing requirements..."
+pip install -r requirements.txt -q
+
+echo "==> Stopping old process (if running)..."
+if [ -f "$PID_FILE" ]; then
+    OLD_PID=$(cat "$PID_FILE")
+    if kill -0 "$OLD_PID" 2>/dev/null; then
+        kill "$OLD_PID"
+        echo "    Killed old process (PID: $OLD_PID)"
+        sleep 1
+    else
+        echo "    No running process found for PID: $OLD_PID"
+    fi
+    rm -f "$PID_FILE"
+else
+    pkill -f "$SCRIPT_NAME" 2>/dev/null && echo "    Killed old $SCRIPT_NAME process" || echo "    No old process found"
+fi
+
+echo "==> Starting bot in background..."
+setsid python "$SCRIPT_NAME" >> bot.log 2>&1 < /dev/null &
+echo $! > "$PID_FILE"
+
+echo "==> Bot started! PID: $(cat $PID_FILE)"
+echo "    Logs: tail -f bot.log"

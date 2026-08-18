@@ -299,6 +299,9 @@ _LAST_MONITOR_STATE: Optional[Tuple[int, int]] = None
 ALLOWED_REACTIONS_CACHE: Dict[str, Optional[list]] = {}
 # (account_key, peer_spec) -> resolved input entity
 PEER_CACHE: Dict[Tuple[str, str], object] = {}
+# (mtime_ns, size) -> (valid, reason), so ten live accounts do not each run a
+# separate 30-second ffprobe for the same audio file.
+AUDIO_VALIDATION_CACHE: Optional[Tuple[int, int, bool, str]] = None
 
 
 # ═══════════════════════ TEXT STYLING ═══════════════════════
@@ -2923,6 +2926,60 @@ def audio_ready() -> bool:
     return TGCALLS_OK and os.path.exists(LIVE_AUDIO_PATH)
 
 
+async def validate_live_audio() -> Tuple[bool, str]:
+    """Verify Heroku has ffmpeg/ffprobe and the uploaded file has audio."""
+    global AUDIO_VALIDATION_CACHE
+    if not TGCALLS_OK:
+        return False, TGCALLS_ERR or "py-tgcalls is not installed"
+    if not os.path.exists(LIVE_AUDIO_PATH):
+        AUDIO_VALIDATION_CACHE = None
+        return False, "no audio file set"
+    try:
+        stat = os.stat(LIVE_AUDIO_PATH)
+        fingerprint = (stat.st_mtime_ns, stat.st_size)
+    except OSError as exc:
+        return False, str(exc)[:120]
+    if AUDIO_VALIDATION_CACHE:
+        old_mtime, old_size, old_valid, old_reason = AUDIO_VALIDATION_CACHE
+        if (old_mtime, old_size) == fingerprint:
+            return old_valid, old_reason
+
+    ffprobe = shutil.which("ffprobe")
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffprobe or not ffmpeg:
+        result = (False, f"ffmpeg/ffprobe missing (ffmpeg={ffmpeg}, ffprobe={ffprobe})")
+        AUDIO_VALIDATION_CACHE = (*fingerprint, *result)
+        return result
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            ffprobe, "-v", "error", "-select_streams", "a:0",
+            "-show_entries", "stream=codec_name", "-of", "default=nw=1:nk=1",
+            LIVE_AUDIO_PATH,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        if proc.returncode != 0 or not stdout.strip():
+            reason = stderr.decode(errors="replace").strip()[:180]
+            result = (False, reason or f"ffprobe exited with {proc.returncode}")
+        else:
+            result = (True, stdout.decode(errors="replace").strip().splitlines()[0])
+        AUDIO_VALIDATION_CACHE = (*fingerprint, *result)
+        return result
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        result = (False, "ffprobe timed out")
+    except ProcessLookupError:
+        result = (False, "ffprobe exited before it could be inspected")
+    except Exception as exc:
+        result = (False, f"{type(exc).__name__}: {str(exc)[:120]}")
+    AUDIO_VALIDATION_CACHE = (*fingerprint, *result)
+    return result
+
+
 def live_stream_source():
     """The looping MP3 every account feeds into a call."""
     return MediaStream(
@@ -3004,17 +3061,33 @@ async def get_tgcalls(key: str):
     return call
 
 
+async def reset_tgcalls_bridge(key: str, chat_id: int):
+    """Discard a bridge whose ffmpeg/native process already exited."""
+    call = TGCALLS.pop(key, None)
+    if call is None:
+        return
+    try:
+        await call._binding.stop(chat_id)
+    except Exception:
+        pass
+    try:
+        executor = getattr(call, "executor", None)
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
+
+
 async def play_live_audio(key: str, chat_id: int) -> Tuple[bool, str]:
     """Put one account into `chat_id`'s call and start streaming the MP3.
 
-    play() performs the real WebRTC join itself, so no JoinGroupCallRequest is
-    sent here — issuing one would conflict, since Telegram permits a single
-    join per peer per call.
+    A failed native/ffmpeg process must not stay cached. The old bridge was
+    reused on every later Go Live attempt, which is why the same
+    ProcessLookupError repeated for every account.
     """
-    if not TGCALLS_OK:
-        return False, "py-tgcalls not installed"
-    if not os.path.exists(LIVE_AUDIO_PATH):
-        return False, "no audio file set"
+    valid, reason = await validate_live_audio()
+    if not valid:
+        return False, reason
     if key not in LIVE_AUDIO.get(chat_id, set()):
         busy = live_busy_in(key)
         if busy is not None:
@@ -3024,17 +3097,29 @@ async def play_live_audio(key: str, chat_id: int) -> Tuple[bool, str]:
         spare = fd_headroom()
         if spare < FD_HEADROOM:
             return False, f"only {spare} file descriptors left"
-    try:
-        call = await get_tgcalls(key)
-        if call is None:
-            return False, "account offline"
-        await call.play(chat_id, live_stream_source(),
-                        GroupCallConfig(auto_start=False))
-        LIVE_AUDIO.setdefault(chat_id, set()).add(key)
-        return True, ""
-    except Exception as e:
-        return False, f"{type(e).__name__}: {e}"[:80]
 
+    for attempt in range(2):
+        try:
+            call = await get_tgcalls(key)
+            if call is None:
+                return False, "account offline"
+            await call.play(chat_id, live_stream_source(),
+                            GroupCallConfig(auto_start=False))
+            LIVE_AUDIO.setdefault(chat_id, set()).add(key)
+            return True, ""
+        except ProcessLookupError:
+            await reset_tgcalls_bridge(key, chat_id)
+            if attempt == 0:
+                await asyncio.sleep(0.5)
+                continue
+            return False, "audio/ffmpeg process exited; bridge reset"
+        except FileNotFoundError as exc:
+            await reset_tgcalls_bridge(key, chat_id)
+            return False, f"audio file/process not found: {exc}"[:120]
+        except Exception as exc:
+            await reset_tgcalls_bridge(key, chat_id)
+            return False, f"{type(exc).__name__}: {exc}"[:120]
+    return False, "audio bridge failed"
 
 async def stop_live_audio(key: str, chat_id: int):
     call = TGCALLS.get(key)
@@ -3186,6 +3271,11 @@ async def process_live_stream_start(channel_id: int, call):
                 ]), buttons=[[btn("Set Audio", "audio_menu", icon="🎵")]])
             except Exception:
                 pass
+        return
+
+    audio_valid, audio_reason = await validate_live_audio()
+    if not audio_valid:
+        logger.warning(f"live stream in {channel_id} cannot start audio — {audio_reason}")
         return
 
     for sub in subs:
@@ -5714,6 +5804,15 @@ async def execute_go_live(event, state, count):
     msg = await event.respond(card(E_REFRESH, "Going Live", [
         S("Finding the live stream..."),
     ]))
+
+    audio_valid, audio_reason = await validate_live_audio()
+    if not audio_valid:
+        return await msg.edit(card(E_WARN, "Live Audio Unavailable", [
+            f"<code>{esc(audio_reason)}</code>",
+            "",
+            S("Check the ffmpeg buildpack and upload a valid audio file."),
+        ]), buttons=[[btn("Audio Menu", "audio_menu", icon="🎵")],
+                     [btn("Home", "home", icon="🏠")]])
 
     # Resolving needs a member, so join the channel first where necessary.
     # With rotation on, pull extra accounts into the channel as well: they stay

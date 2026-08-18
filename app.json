@@ -1,0 +1,36 @@
+{
+  "name": "Telegram Views & Reactions Bot",
+  "description": "Telegram SMM bot — views & reactions booster with multi-account session management. Accounts auto-backup to MongoDB, so they survive Heroku dyno restarts.",
+  "repository": "https://github.com/avinashraz19818/zayrosmmm",
+  "keywords": ["telegram", "telethon", "views", "reactions", "smm", "bot"],
+  "buildpacks": [
+    {
+      "url": "https://github.com/jonathanong/heroku-buildpack-ffmpeg-latest.git"
+    },
+    {
+      "url": "heroku/python"
+    }
+  ],
+  "env": {
+    "API_ID": {
+      "description": "Telegram API ID (my.telegram.org). Optional — hardcoded default is used when left blank.",
+      "required": false
+    },
+    "API_HASH": {
+      "description": "Telegram API hash (my.telegram.org). Optional — hardcoded default is used when left blank.",
+      "required": false
+    },
+    "BOT_TOKEN": {
+      "description": "Telegram bot token from @BotFather. Optional — hardcoded default is used when left blank.",
+      "required": false
+    },
+    "MONGO_URI": {
+      "description": "MongoDB Atlas connection string (mongodb+srv://...). Optional — hardcoded default is used when left blank.",
+      "required": false
+    },
+    "OWNER_IDS": {
+      "description": "Comma-separated Telegram user IDs allowed to use the bot. Optional — hardcoded default is used when left blank.",
+      "required": false
+    }
+  }
+}

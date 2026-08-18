@@ -1,6 +1,8 @@
-python-telegram-bot==20.7
-pyrogram==2.0.106
-tgcrypto==1.2.5
-pydub==0.25.1
-ffmpeg-python==0.2.0
-ntgcalls
+# Core dependencies actually used by view.py
+telethon==1.36.0
+motor==3.7.1
+# Live-audio (voice chat streaming) — optional at runtime (view.py boots
+# without it), but needed for the live audio feature. ntgcalls is the native
+# engine py-tgcalls wraps; both pins exist on PyPI with manylinux wheels.
+py-tgcalls==2.2.11
+ntgcalls==2.1.0

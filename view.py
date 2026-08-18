@@ -73,6 +73,11 @@ except Exception as _e:
     TGCALLS_OK = False
     TGCALLS_ERR = f"{type(_e).__name__}: {_e}"
 
+# Session backup/restore so accounts survive Heroku's ephemeral filesystem
+# (dyno restarts wipe the sessions folder — session_store.py re-creates it
+# from MongoDB at boot).
+import session_store
+
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO
 )
@@ -90,12 +95,14 @@ for _noisy in ("telethon", "telethon.client.updates", "telethon.network",
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 # ═══════════════════════ CONFIGURATION ═══════════════════════
-API_ID = 21538384
-API_HASH = "9b8e9b10a5c34b67054aceca02bf423e"
-BOT_TOKEN = "8912703088:AAG1YBb91E3l0h6Uqdk0azztRpRSnwpYva0"
-MONGO_URI = "mongodb+srv://avinash:avinash12@cluster0.wnwd1fv.mongodb.net/?appName=Cluster0"
+# Values come from environment variables first (Heroku Config Vars), with the
+# original hardcoded values as fallback so the VPS setup keeps working as-is.
+API_ID = int(os.environ.get("API_ID") or 21538384)
+API_HASH = os.environ.get("API_HASH") or "9b8e9b10a5c34b67054aceca02bf423e"
+BOT_TOKEN = os.environ.get("BOT_TOKEN") or "8912703088:AAG1YBb91E3l0h6Uqdk0azztRpRSnwpYva0"
+MONGO_URI = os.environ.get("MONGO_URI") or "mongodb+srv://avinash:avinash12@cluster0.wnwd1fv.mongodb.net/?appName=Cluster0"
 
-OWNER_IDS = [8015937475]
+OWNER_IDS = [int(x) for x in os.environ.get("OWNER_IDS", "8015937475").split(",") if x.strip()]
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SESSIONS_DIR = os.path.join(BASE_DIR, "sessions")
@@ -5909,6 +5916,15 @@ async def main():
     print(f"  bot          : @{me.username}")
     print("=" * 58)
 
+    # Fresh Heroku dyno? The sessions folder was just wiped — pull the account
+    # files back from the MongoDB backup before loading anything.
+    try:
+        restored = await session_store.restore_sessions(mdb, SESSIONS_DIR)
+        if restored:
+            print(f"  sessions     : {restored} account(s) restored from MongoDB")
+    except Exception as e:
+        print(f"  sessions     : backup restore failed - {e}")
+
     tally = await load_all_sessions()
     print(f"  accounts     : {acc_count()} online "
           f"(dead {tally['dead']}, unclear {tally['unknown']})")
@@ -5924,6 +5940,13 @@ async def main():
     asyncio.create_task(expiry_check_task())
     asyncio.create_task(keep_alive_task())
     asyncio.create_task(onboard_sweep_task())
+    asyncio.create_task(session_store.backup_task(mdb, SESSIONS_DIR))
+    # First sync right away so a brand-new deploy is backed up immediately,
+    # not only after the first 5-minute interval.
+    try:
+        await session_store.backup_sessions(mdb, SESSIONS_DIR)
+    except Exception as e:
+        print(f"  sessions     : initial backup failed - {e}")
 
     if not TGCALLS_OK:
         print(f"  live audio   : UNAVAILABLE — {TGCALLS_ERR}")

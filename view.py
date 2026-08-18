@@ -152,6 +152,12 @@ CONFIG_MISSING = [
 # Telethon and ffmpeg require filesystem paths. The manifest lets us replace a
 # GridFS object atomically and avoids duplicate versions on every dyno restart.
 STORAGE_SYNC_INTERVAL = max(30, _env_int("STORAGE_SYNC_INTERVAL", 120))
+# Session probing is network-bound. A small bounded fan-out is much faster than
+# importing a ZIP one account at a time, while still avoiding a Telegram flood
+# storm on a dyno.
+SESSION_CONNECT_CONCURRENCY = max(4, _env_int("SESSION_CONNECT_CONCURRENCY", 12))
+ZIP_IMPORT_CONCURRENCY = max(4, _env_int("ZIP_IMPORT_CONCURRENCY", 12))
+SESSION_PROBE_TIMEOUT = max(30, _env_int("SESSION_PROBE_TIMEOUT", 60))
 
 # Every live audio stream costs an ffmpeg process, a WebRTC connection and a
 # second MTProto socket. The usual 1024-descriptor default runs out partway
@@ -1319,7 +1325,7 @@ async def load_all_sessions(progress=None) -> dict:
     logger.info(f"{len(files)} .session file(s) found")
 
     tally = {"alive": 0, "dead": 0, "unknown": 0}
-    sem = asyncio.Semaphore(10)
+    sem = asyncio.Semaphore(SESSION_CONNECT_CONCURRENCY)
 
     async def one(path):
         async with sem:
@@ -6448,26 +6454,39 @@ async def handle_zip_import(event):
                  "desktop": 0, "android": 0}
         new_keys: List[str] = []
 
-        for i, src in enumerate(found, 1):
+        # Reserve unique destination names before starting concurrent probes.
+        reserved = set(os.listdir(SESSIONS_DIR))
+        destinations = []
+        for src in found:
             stem = os.path.splitext(os.path.basename(src))[0]
-            dest = os.path.join(SESSIONS_DIR, stem + ".session")
+            name = stem + ".session"
             n = 1
-            while os.path.exists(dest):
-                dest = os.path.join(SESSIONS_DIR, f"{stem}_{n}.session")
+            while name in reserved:
+                name = f"{stem}_{n}.session"
                 n += 1
+            reserved.add(name)
+            destinations.append(os.path.join(SESSIONS_DIR, name))
+
+        async def import_one(index: int, src: str, dest: str) -> dict:
+            """Copy and probe one session; several independent accounts run in parallel."""
+            stem = os.path.splitext(os.path.basename(dest))[0]
+            result = {"state": "unknown", "key": None, "no_meta": 0,
+                      "desktop": 0, "android": 0}
             try:
                 shutil.copy2(src, dest)
-            except Exception as e:
-                logger.warning(f"copy {src}: {e}")
-                continue
+            except Exception as exc:
+                logger.warning(f"copy {src}: {exc}")
+                return result
 
             # A session's auth key is bound to the api_id that made it, and
             # Telegram checks the device signature against that api_id. Carry
             # the bundle's own json across or the session gets revoked in a day
             # or two — this is the single biggest cause of ZIP accounts dying.
             meta = {}
-            for cand in (os.path.splitext(src)[0] + ".json",
-                         os.path.join(os.path.dirname(src), stem + ".json")):
+            source_stem = os.path.splitext(src)[0]
+            for cand in (source_stem + ".json",
+                         os.path.join(os.path.dirname(src),
+                                      os.path.basename(source_stem) + ".json")):
                 if os.path.exists(cand):
                     try:
                         with open(cand, "r", encoding="utf-8") as fh:
@@ -6480,32 +6499,61 @@ async def handle_zip_import(event):
 
             api_id, api_hash = creds_from_meta(meta)
             if not meta_get(meta, "api_id"):
-                stats["no_meta"] += 1
+                result["no_meta"] = 1
             device = device_profile_for(api_id, meta)
-            if device["device_model"] == DESKTOP_PROFILE["device_model"]:
-                stats["desktop"] += 1
-            else:
-                stats["android"] += 1
+            result["desktop" if device["device_model"] == DESKTOP_PROFILE["device_model"]
+                   else "android"] = 1
             write_meta(dest, api_id=api_id, api_hash=api_hash,
                        user_id=meta_get(meta, "user_id") or 0,
                        first_name=meta_get(meta, "first_name") or "",
                        phone=meta_get(meta, "phone") or "", **device)
-            # Persist even an account that later needs review so an ephemeral
-            # dyno restart never loses the imported credential file.
-            await persist_session_bundle(dest)
 
-            # NB: do not call this `state` — that name is the import flow's own
-            # variable and shadowing it here broke nothing yet only by luck.
-            res_state, _acc = await probe_and_register(dest)
-            stats[res_state] += 1
-            if res_state == "alive" and _acc and _acc.key:
-                new_keys.append(_acc.key)
-            await asyncio.sleep(0.2)
-            await prog.show(progress_card("Importing", i, len(found), [
+            try:
+                # Do not upload twice. probe_and_register persists a live
+                # session; this call covers dead/unclear files too.
+                res_state, acc = await asyncio.wait_for(
+                    probe_and_register(dest), timeout=SESSION_PROBE_TIMEOUT)
+            except asyncio.TimeoutError:
+                res_state, acc = "unknown", None
+                PROBLEM_SESSIONS[stem] = "probe timeout"
+                logger.warning("%s: session probe timed out after %ss",
+                               stem, SESSION_PROBE_TIMEOUT)
+            except Exception as exc:
+                res_state, acc = "unknown", None
+                logger.warning("%s: import probe failed: %s", stem, exc)
+            try:
+                await persist_session_bundle(dest)
+            except Exception as exc:
+                logger.warning("%s: MongoDB session save failed: %s", stem, exc)
+            result["state"] = res_state
+            result["key"] = acc.key if res_state == "alive" and acc else None
+            return result
+
+        # Ten-to-twelve Telegram connections at once is much faster than the
+        # old one-at-a-time loop without opening 118 sockets simultaneously.
+        for offset in range(0, len(found), ZIP_IMPORT_CONCURRENCY):
+            batch = list(enumerate(
+                zip(found[offset:offset + ZIP_IMPORT_CONCURRENCY],
+                    destinations[offset:offset + ZIP_IMPORT_CONCURRENCY]),
+                offset + 1,
+            ))
+            results = await asyncio.gather(
+                *(import_one(index, src, dest) for index, (src, dest) in batch),
+                return_exceptions=False,
+            )
+            for result in results:
+                stats[result["state"]] += 1
+                stats["no_meta"] += result["no_meta"]
+                stats["desktop"] += result["desktop"]
+                stats["android"] += result["android"]
+                if result["key"]:
+                    new_keys.append(result["key"])
+            done = min(offset + len(results), len(found))
+            await prog.show(progress_card("Importing", done, len(found), [
                 field(E_GREEN, "Online", str(stats["alive"])),
                 field(E_RED, "Not authorised", str(stats["dead"])),
                 field(E_WARN, "Unclear", str(stats["unknown"])),
-            ]))
+            ]), force=True)
 
         for s in strings:
             imported = await import_string_session(s)

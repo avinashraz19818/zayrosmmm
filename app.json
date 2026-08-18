@@ -5,7 +5,7 @@
   "keywords": ["telegram", "telethon", "mongodb", "gridfs", "heroku"],
   "buildpacks": [
     {
-      "url": "https://github.com/heroku/heroku-buildpack-apt"
+      "url": "https://github.com/jonathanong/heroku-buildpack-ffmpeg-latest.git"
     },
     {
       "url": "heroku/python"

@@ -1770,14 +1770,20 @@ async def onboard_new_accounts(keys: List[str],
 
         if fresh:
             total_now = len(already_in | set(fresh))
+            # ``accounts_count`` is the package target, while
+            # ``joined_accounts`` is the current membership snapshot. After a
+            # deliberate session purge the snapshot can be empty even though
+            # the client still bought N accounts; never shrink the package to
+            # the number of replacement accounts added so far.
+            package_target = max(
+                int(sub.get("accounts_count", 0) or 0),
+                total_now,
+            )
             try:
                 await col_clients.update_one(
                     {"_id": sub["_id"]},
                     {"$addToSet": {"joined_accounts": {"$each": fresh}},
-                     # The package size follows the real membership: the client
-                     # bought N accounts and now has more, and every picker
-                     # reads accounts_count when deciding how many to use.
-                     "$set": {"accounts_count": total_now,
+                     "$set": {"accounts_count": package_target,
                               "updated_at": utcnow()}})
                 stats["subs_grown"] += 1
                 logger.info(f"onboard: {sub.get('channel_link')} "

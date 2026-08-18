@@ -1,13 +1,18 @@
 """
 Telegram account manager / SMM bot.
 
-Accounts live in the sessions/ folder (that folder is the single source of truth
-for logins). MongoDB holds only client subscriptions, approved users and the
-activity log — no session material.
+MongoDB is the source of truth for client data, approvals, activity, Telegram
+sessions, the bot session, the session trash and the live-audio file. Telethon
+still needs local SQLite files while a dyno is running, so session files are
+restored into an ephemeral working directory at boot and synced back to MongoDB.
+That makes Heroku dyno restarts/redeploys safe instead of treating the dyno disk
+as permanent storage.
 """
 
 import asyncio
 import contextlib
+import hashlib
+import io
 import logging
 import re
 import sys
@@ -17,6 +22,7 @@ import os
 import json
 import zipfile
 import shutil
+import signal
 import sqlite3
 import tempfile
 import time
@@ -57,7 +63,7 @@ from telethon.tl.types import (
     UpdateGroupCall, GroupCall,
     InputCheckPasswordSRP, PasswordKdfAlgoSHA256SHA256PBKDF2HMACSHA512iter100000SHA256ModPow,
 )
-from motor.motor_asyncio import AsyncIOMotorClient
+from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorGridFSBucket
 from bson.objectid import ObjectId
 
 # Optional so the bot still boots on a host without ffmpeg/ntgcalls; every
@@ -90,18 +96,60 @@ for _noisy in ("telethon", "telethon.client.updates", "telethon.network",
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 # ═══════════════════════ CONFIGURATION ═══════════════════════
-API_ID = 21538384
-API_HASH = "9b8e9b10a5c34b67054aceca02bf423e"
-BOT_TOKEN = "8912703088:AAG1YBb91E3l0h6Uqdk0azztRpRSnwpYva0"
-MONGO_URI = "mongodb+srv://avinash:avinash12@cluster0.wnwd1fv.mongodb.net/?appName=Cluster0"
+def _env_int(name: str, default: int = 0) -> int:
+    try:
+        return int(os.getenv(name, str(default)).strip())
+    except (TypeError, ValueError):
+        return default
 
-OWNER_IDS = [8015937475]
+
+API_ID = _env_int("API_ID")
+API_HASH = os.getenv("API_HASH", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+# A localhost URI is only a development fallback. Heroku must receive the
+# Atlas URI through Config Vars; no secret is kept in the repository.
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://127.0.0.1:27017").strip()
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "tg_manager_bot").strip() or "tg_manager_bot"
+GRIDFS_BUCKET = os.getenv("MONGO_GRIDFS_BUCKET", "tg_manager_storage").strip() or "tg_manager_storage"
+OWNER_IDS = [
+    int(part.strip())
+    for part in os.getenv("OWNER_IDS", "").split(",")
+    if part.strip().lstrip("-").isdigit()
+]
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SESSIONS_DIR = os.path.join(BASE_DIR, "sessions")
-TRASH_DIR = os.path.join(BASE_DIR, "sessions_trash")
+# The dyno filesystem is deliberately only a working cache. The old VPS paths
+# are retained as migration sources when they exist, but are never the source
+# of truth after boot.
+LEGACY_SESSIONS_DIR = os.path.join(BASE_DIR, "sessions")
+LEGACY_TRASH_DIR = os.path.join(BASE_DIR, "sessions_trash")
+LEGACY_AUDIO_PATH = os.path.join(BASE_DIR, "audio", "live.mp3")
+LEGACY_BOT_SESSION_BASE = os.path.join(BASE_DIR, "bot_session")
+RUNTIME_ROOT = os.getenv("RUNTIME_DIR", "").strip() or tempfile.mkdtemp(prefix="tg-manager-")
+SESSIONS_DIR = os.path.join(RUNTIME_ROOT, "sessions")
+TRASH_DIR = os.path.join(RUNTIME_ROOT, "sessions_trash")
+AUDIO_DIR = os.path.join(RUNTIME_ROOT, "audio")
+LIVE_AUDIO_PATH = os.path.join(AUDIO_DIR, "live.mp3")
+BOT_SESSION_BASE = os.path.join(RUNTIME_ROOT, "bot_session")
 os.makedirs(SESSIONS_DIR, exist_ok=True)
-os.makedirs(os.path.join(BASE_DIR, "audio"), exist_ok=True)
+os.makedirs(TRASH_DIR, exist_ok=True)
+os.makedirs(AUDIO_DIR, exist_ok=True)
+
+# These are configuration errors, not Telegram/account errors. main() prints a
+# useful message and exits before trying to connect when any required secret is
+# absent.
+CONFIG_MISSING = [
+    name for name, value in (("API_ID", API_ID), ("API_HASH", API_HASH),
+                             ("BOT_TOKEN", BOT_TOKEN),
+                             ("MONGO_URI", os.getenv("MONGO_URI", "").strip()),
+                             ("OWNER_IDS", OWNER_IDS))
+    if not value or value == 0
+]
+
+# Mongo/GridFS is authoritative. Files are materialised locally only because
+# Telethon and ffmpeg require filesystem paths. The manifest lets us replace a
+# GridFS object atomically and avoids duplicate versions on every dyno restart.
+STORAGE_SYNC_INTERVAL = max(30, _env_int("STORAGE_SYNC_INTERVAL", 120))
 
 # Every live audio stream costs an ffmpeg process, a WebRTC connection and a
 # second MTProto socket. The usual 1024-descriptor default runs out partway
@@ -153,9 +201,9 @@ MONITOR_CLIENTS = 5
 LIVE_POLL_SECONDS = 20
 # Telegram drops a silent participant after ~60s, so re-assert well inside that.
 LIVE_KEEPALIVE_SECONDS = 30
-# The MP3 every account streams into a live call.
-AUDIO_DIR = os.path.join(BASE_DIR, "audio")
-LIVE_AUDIO_PATH = os.path.join(AUDIO_DIR, "live.mp3")
+# The MP3 every account streams into a live call. AUDIO_DIR/LIVE_AUDIO_PATH
+# point at the ephemeral working copy declared in the configuration block;
+# the canonical copy lives in MongoDB GridFS under ``audio/live.mp3``.
 # ffmpeg restarts the file this many times. NOT -1: py-tgcalls filters argv
 # against `ffmpeg -h full` and drops any token starting with "-", which would
 # silently strip the "-1" and leave a broken bare "-stream_loop".
@@ -501,24 +549,348 @@ def is_dead_account_error(err: Exception) -> bool:
     return any(m in msg for m in DEAD_ACCOUNT_MARKERS)
 
 
-# ═══════════════════════ MONGODB (clients only) ═══════════════════════
+# ═══════════════════════ MONGODB / GRIDFS STORAGE ═══════════════════════
 try:
-    mongo_client = AsyncIOMotorClient(MONGO_URI, serverSelectionTimeoutMS=20000)
-    mdb = mongo_client["tg_manager_bot"]
+    mongo_client = AsyncIOMotorClient(
+        MONGO_URI,
+        serverSelectionTimeoutMS=20000,
+        connectTimeoutMS=20000,
+        retryWrites=True,
+    )
+    mdb = mongo_client[MONGO_DB_NAME]
     col_history = mdb["history"]
     col_approved = mdb["approved_users"]
     col_clients = mdb["clients"]
     col_stats = mdb["bot_stats"]
     col_settings = mdb["settings"]
-    logger.info("MongoDB client created")
+    # GridFS is used instead of a normal document so large audio files are not
+    # limited by MongoDB's 16 MB document limit. Session SQLite files and JSON
+    # sidecars use the same store, which keeps one backup/restore path for all
+    # runtime data.
+    storage_bucket = AsyncIOMotorGridFSBucket(mdb, bucket_name=GRIDFS_BUCKET)
+    col_storage = mdb["storage_manifest"]
+    storage_lock = asyncio.Lock()
+    logger.info("MongoDB/GridFS client created")
 except Exception as e:
     logger.error(f"MongoDB error: {e}")
-    sys.exit(1)
+    # Keep import-time errors visible without killing tooling such as py_compile;
+    # main() performs the real connection check and exits cleanly.
+    mongo_client = None
+    mdb = None
+    storage_bucket = None
+    col_storage = None
+    storage_lock = asyncio.Lock()
 
 
-# ═══════════════════════ ACCOUNT STORE (sessions folder) ═══════════════════════
+_LOCAL_UPLOAD_FINGERPRINTS: Dict[str, Tuple[int, int]] = {}
+
+
+def _storage_name(kind: str, filename: str) -> str:
+    """Return a safe, stable GridFS/manifest name."""
+    filename = filename.replace("\\", "/").lstrip("/")
+    filename = "/".join(part for part in filename.split("/") if part not in ("", ".", ".."))
+    return f"{kind.strip('/')}/{filename}" if filename else kind.strip("/")
+
+
+def _session_remote_name(session_path: str) -> str:
+    path = os.path.abspath(session_path)
+    for directory, kind in ((SESSIONS_DIR, "sessions"), (TRASH_DIR, "trash")):
+        root = os.path.abspath(directory)
+        try:
+            rel = os.path.relpath(path, root)
+        except ValueError:
+            rel = ".."
+        if rel != ".." and not rel.startswith(".." + os.sep):
+            return _storage_name(kind, rel)
+    return _storage_name("sessions", os.path.basename(path))
+
+
+def _bot_remote_name(path: str) -> str:
+    return _storage_name("bot", os.path.basename(path))
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+async def _storage_manifest(name: str) -> Optional[dict]:
+    if col_storage is None:
+        return None
+    return await col_storage.find_one({"_id": name})
+
+
+async def storage_put_path(name: str, path: str, kind: str = "runtime",
+                           force: bool = False) -> bool:
+    """Upload a local file to GridFS and atomically update its manifest."""
+    if storage_bucket is None or col_storage is None or not os.path.exists(path):
+        return False
+    stat = await asyncio.to_thread(os.stat, path)
+    fingerprint = (stat.st_size, stat.st_mtime_ns)
+    manifest = await _storage_manifest(name)
+    if not force and _LOCAL_UPLOAD_FINGERPRINTS.get(name) == fingerprint and manifest:
+        return False
+    digest = await asyncio.to_thread(_sha256_file, path)
+    if not force and manifest and manifest.get("sha256") == digest:
+        _LOCAL_UPLOAD_FINGERPRINTS[name] = fingerprint
+        return False
+
+    async with storage_lock:
+        # Re-check after waiting so two callbacks cannot upload two copies of
+        # the same session at once.
+        manifest = await _storage_manifest(name)
+        if not force and manifest and manifest.get("sha256") == digest:
+            _LOCAL_UPLOAD_FINGERPRINTS[name] = fingerprint
+            return False
+        with open(path, "rb") as source:
+            file_id = await storage_bucket.upload_from_stream(
+                name,
+                source,
+                metadata={"kind": kind, "sha256": digest, "size": stat.st_size},
+            )
+        document = {
+            "_id": name,
+            "gridfs_id": file_id,
+            "kind": kind,
+            "sha256": digest,
+            "size": stat.st_size,
+            "updated_at": utcnow(),
+        }
+        await col_storage.replace_one({"_id": name}, document, upsert=True)
+        old_id = manifest.get("gridfs_id") if manifest else None
+        if old_id and old_id != file_id:
+            try:
+                await storage_bucket.delete(old_id)
+            except Exception:
+                logger.debug("could not remove old GridFS version for %s", name)
+    _LOCAL_UPLOAD_FINGERPRINTS[name] = fingerprint
+    return True
+
+
+async def storage_put_bytes(name: str, data: bytes, kind: str = "runtime") -> bool:
+    """Store a small object (sessions/trash metadata) without a temp file."""
+    if storage_bucket is None or col_storage is None:
+        return False
+    digest = hashlib.sha256(data).hexdigest()
+    manifest = await _storage_manifest(name)
+    if manifest and manifest.get("sha256") == digest:
+        return False
+    async with storage_lock:
+        manifest = await _storage_manifest(name)
+        if manifest and manifest.get("sha256") == digest:
+            return False
+        file_id = await storage_bucket.upload_from_stream(
+            name, io.BytesIO(data),
+            metadata={"kind": kind, "sha256": digest, "size": len(data)},
+        )
+        await col_storage.replace_one(
+            {"_id": name},
+            {"_id": name, "gridfs_id": file_id, "kind": kind,
+             "sha256": digest, "size": len(data), "updated_at": utcnow()},
+            upsert=True,
+        )
+        old_id = manifest.get("gridfs_id") if manifest else None
+        if old_id and old_id != file_id:
+            try:
+                await storage_bucket.delete(old_id)
+            except Exception:
+                logger.debug("could not remove old GridFS version for %s", name)
+    return True
+
+
+async def storage_get_bytes(name: str) -> Optional[bytes]:
+    manifest = await _storage_manifest(name)
+    if not manifest or storage_bucket is None:
+        return None
+    output = io.BytesIO()
+    try:
+        await storage_bucket.download_to_stream(manifest["gridfs_id"], output)
+        return output.getvalue()
+    except Exception as exc:
+        logger.warning("GridFS download failed for %s: %s", name, exc)
+        return None
+
+
+async def storage_download_path(name: str, path: str, force: bool = True) -> bool:
+    """Materialise a GridFS object into a local working path atomically."""
+    manifest = await _storage_manifest(name)
+    if not manifest or storage_bucket is None:
+        return False
+    if not force and os.path.exists(path):
+        return True
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    partial = path + ".part"
+    try:
+        with open(partial, "wb") as destination:
+            await storage_bucket.download_to_stream(manifest["gridfs_id"], destination)
+        os.replace(partial, path)
+        stat = os.stat(path)
+        _LOCAL_UPLOAD_FINGERPRINTS[name] = (stat.st_size, stat.st_mtime_ns)
+        return True
+    except Exception as exc:
+        logger.warning("GridFS restore failed for %s: %s", name, exc)
+        try:
+            os.unlink(partial)
+        except FileNotFoundError:
+            pass
+        return False
+
+
+async def storage_delete(name: str) -> bool:
+    if storage_bucket is None or col_storage is None:
+        return False
+    async with storage_lock:
+        manifest = await _storage_manifest(name)
+        if not manifest:
+            return False
+        try:
+            await storage_bucket.delete(manifest["gridfs_id"])
+        except Exception:
+            pass
+        await col_storage.delete_one({"_id": name})
+    _LOCAL_UPLOAD_FINGERPRINTS.pop(name, None)
+    return True
+
+
+async def storage_move(source_name: str, destination_name: str,
+                       kind: str = "session") -> bool:
+    data = await storage_get_bytes(source_name)
+    if data is None:
+        return False
+    if not await storage_put_bytes(destination_name, data, kind=kind):
+        # An identical destination is still a successful copy; only the delete
+        # below is needed to complete the move.
+        if not await _storage_manifest(destination_name):
+            return False
+    await storage_delete(source_name)
+    return True
+
+
+async def persist_session_bundle(session_path: str):
+    """Persist the SQLite session and its device/API sidecar together."""
+    await storage_put_path(_session_remote_name(session_path), session_path, "session")
+    sidecar = meta_path(session_path)
+    if os.path.exists(sidecar):
+        await storage_put_path(_session_remote_name(sidecar), sidecar, "session_meta")
+
+
+async def restore_runtime_storage():
+    """Restore all remote runtime objects into the ephemeral working tree."""
+    if col_storage is None:
+        return
+    docs = []
+    async for document in col_storage.find({
+        "kind": {"$in": ["session", "session_meta", "trash", "audio", "bot_session"]}
+    }):
+        docs.append(document)
+
+    async def restore(document):
+        name = document["_id"]
+        if name.startswith("sessions/"):
+            target = os.path.join(SESSIONS_DIR, name[len("sessions/"):])
+        elif name.startswith("trash/"):
+            target = os.path.join(TRASH_DIR, name[len("trash/"):])
+        elif name == "audio/live.mp3":
+            target = LIVE_AUDIO_PATH
+        elif name.startswith("bot/"):
+            target = os.path.join(RUNTIME_ROOT, name[len("bot/"):])
+        else:
+            return
+        await storage_download_path(name, target)
+
+    sem = asyncio.Semaphore(6)
+
+    async def limited(document):
+        async with sem:
+            await restore(document)
+
+    await asyncio.gather(*(limited(document) for document in docs))
+    logger.info("Restored %d runtime object(s) from MongoDB/GridFS", len(docs))
+
+
+async def migrate_legacy_storage_if_needed():
+    """Import old VPS files once, without overwriting a newer Mongo copy."""
+    if col_storage is None:
+        return
+
+    async def import_if_missing(name: str, path: str, kind: str):
+        if os.path.isfile(path) and not await _storage_manifest(name):
+            await storage_put_path(name, path, kind=kind, force=True)
+            logger.info("Migrated legacy file %s -> MongoDB", path)
+
+    if os.path.isdir(LEGACY_SESSIONS_DIR):
+        for root, _dirs, files in os.walk(LEGACY_SESSIONS_DIR):
+            for filename in files:
+                if not filename.endswith((".session", ".json", ".txt", ".imported")):
+                    continue
+                path = os.path.join(root, filename)
+                rel = os.path.relpath(path, LEGACY_SESSIONS_DIR)
+                await import_if_missing(_storage_name("sessions", rel), path, "session")
+    if os.path.isdir(LEGACY_TRASH_DIR):
+        for root, _dirs, files in os.walk(LEGACY_TRASH_DIR):
+            for filename in files:
+                path = os.path.join(root, filename)
+                rel = os.path.relpath(path, LEGACY_TRASH_DIR)
+                await import_if_missing(_storage_name("trash", rel), path, "trash")
+    await import_if_missing("audio/live.mp3", LEGACY_AUDIO_PATH, "audio")
+    for suffix in (".session", ".session-journal", ".session-wal", ".session-shm"):
+        await import_if_missing(_bot_remote_name("bot_session" + suffix),
+                                LEGACY_BOT_SESSION_BASE + suffix, "bot_session")
+
+
+async def sync_runtime_storage():
+    """Push changed working files to MongoDB; safe to run periodically."""
+    if col_storage is None:
+        return
+    paths = []
+    for directory, kind in ((SESSIONS_DIR, "session"), (TRASH_DIR, "trash")):
+        for root, _dirs, files in os.walk(directory):
+            for filename in files:
+                if filename.endswith((".session", ".json")):
+                    paths.append((_storage_name("sessions" if kind == "session" else "trash",
+                                                os.path.relpath(os.path.join(root, filename), directory)),
+                                  os.path.join(root, filename), kind))
+    if os.path.exists(LIVE_AUDIO_PATH):
+        paths.append(("audio/live.mp3", LIVE_AUDIO_PATH, "audio"))
+    for suffix in (".session", ".session-journal", ".session-wal", ".session-shm"):
+        path = BOT_SESSION_BASE + suffix
+        if os.path.exists(path):
+            paths.append((_bot_remote_name("bot_session" + suffix), path, "bot_session"))
+    for name, path, kind in paths:
+        try:
+            await storage_put_path(name, path, kind=kind)
+        except Exception as exc:
+            logger.warning("Runtime storage sync failed for %s: %s", name, exc)
+
+
+async def runtime_storage_task():
+    while True:
+        await asyncio.sleep(STORAGE_SYNC_INTERVAL)
+        try:
+            await sync_runtime_storage()
+        except Exception as exc:
+            logger.error("runtime storage sweep: %s", exc)
+
+
+async def ensure_database_indexes():
+    """Keep the MongoDB collections used by the bot queryable after migration."""
+    await col_clients.create_index([("client_user_id", 1), ("status", 1)])
+    await col_clients.create_index([("channel_id", 1), ("status", 1), ("expires_at", 1)])
+    await col_history.create_index([("timestamp", -1)])
+    await col_approved.create_index("user_id")
+    await col_storage.create_index("gridfs_id")
+
+
+# ═══════════════════════ ACCOUNT STORE (MongoDB-backed sessions) ═══════════════════════
 class Account:
-    """One logged-in account, backed by a .session file in sessions/."""
+    """One logged-in account backed by a MongoDB/GridFS session bundle.
+
+    ``path`` is only the current dyno's local SQLite working copy; it is synced
+    back to MongoDB after imports, logins and during the periodic storage sweep.
+    """
 
     __slots__ = ("key", "stem", "path", "phone", "user_id", "name",
                  "api_id", "api_hash", "device", "client", "state")
@@ -630,12 +1002,8 @@ def creds_from_meta(meta: dict) -> Tuple[int, str]:
     return API_ID, API_HASH
 
 
-def to_trash(session_path: str) -> int:
-    """Move a session (and its sidecar) to sessions_trash instead of deleting it.
-
-    Deleting is irreversible and a wrong "this is dead" call then costs a real
-    account, so nothing here ever unlinks a file.
-    """
+async def to_trash(session_path: str) -> int:
+    """Move a session bundle to MongoDB-backed trash instead of deleting it."""
     os.makedirs(TRASH_DIR, exist_ok=True)
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     stem = os.path.splitext(os.path.basename(session_path))[0]
@@ -643,43 +1011,64 @@ def to_trash(session_path: str) -> int:
     base = os.path.splitext(session_path)[0]
     for ext in (".session", ".session-journal", ".session-wal", ".session-shm", ".json"):
         src = base + ext
-        if os.path.exists(src):
-            try:
-                os.replace(src, os.path.join(TRASH_DIR, f"{stem}_{stamp}{ext}"))
-                moved += 1
-            except Exception as e:
-                logger.warning(f"trash {src}: {e}")
+        if not os.path.exists(src):
+            continue
+        destination = os.path.join(TRASH_DIR, f"{stem}_{stamp}{ext}")
+        try:
+            os.replace(src, destination)
+            source_name = _session_remote_name(src)
+            destination_name = _storage_name("trash", os.path.basename(destination))
+            moved_remote = await storage_move(source_name, destination_name,
+                                              kind="trash")
+            if not moved_remote:
+                # This covers a newly-created local session that has not reached
+                # the periodic sweep yet. Upload the moved local copy before
+                # considering the operation complete.
+                await storage_put_path(destination_name, destination,
+                                       kind="trash", force=True)
+                await storage_delete(source_name)
+            moved += 1
+        except Exception as exc:
+            logger.warning("trash %s: %s", src, exc)
     return moved
 
 
 def trash_entries() -> List[str]:
+    """List the restored local trash mirror for the current dyno."""
     if not os.path.isdir(TRASH_DIR):
         return []
     return sorted(f for f in os.listdir(TRASH_DIR) if f.endswith(".session"))
 
 
-def restore_from_trash() -> int:
-    """Move every trashed session back into sessions/."""
+async def restore_from_trash() -> int:
+    """Restore every trashed session and sidecar, then sync the move to Mongo."""
     restored = 0
-    for f in trash_entries():
-        stem = f[: -len(".session")]
-        # strip the _YYYYmmdd_HHMMSS stamp to recover the original name
+    for filename in trash_entries():
+        stem = filename[: -len(".session")]
         orig = re.sub(r"_\d{8}_\d{6}$", "", stem)
         for ext in (".session", ".json"):
-            src = os.path.join(TRASH_DIR, stem + ext)
-            if not os.path.exists(src):
+            source = os.path.join(TRASH_DIR, stem + ext)
+            if not os.path.exists(source):
                 continue
-            dest = os.path.join(SESSIONS_DIR, orig + ext)
+            destination = os.path.join(SESSIONS_DIR, orig + ext)
             n = 1
-            while os.path.exists(dest):
-                dest = os.path.join(SESSIONS_DIR, f"{orig}_{n}{ext}")
+            while os.path.exists(destination):
+                destination = os.path.join(SESSIONS_DIR, f"{orig}_{n}{ext}")
                 n += 1
             try:
-                os.replace(src, dest)
+                os.replace(source, destination)
+                source_name = _storage_name("trash", os.path.basename(source))
+                destination_name = _session_remote_name(destination)
+                moved_remote = await storage_move(source_name, destination_name,
+                                                  kind="session")
+                if not moved_remote:
+                    await storage_put_path(destination_name, destination,
+                                           kind="session", force=True)
+                    await storage_delete(source_name)
                 if ext == ".session":
                     restored += 1
-            except Exception as e:
-                logger.warning(f"restore {src}: {e}")
+            except Exception as exc:
+                logger.warning("restore %s: %s", source, exc)
     return restored
 
 
@@ -736,6 +1125,7 @@ async def probe_and_register(session_path: str) -> Tuple[str, Optional[Account]]
             write_meta(session_path, api_id=api_id, api_hash=api_hash,
                        user_id=acc.user_id, phone=acc.phone,
                        first_name=acc.name, **device)
+            await persist_session_bundle(session_path)
             return "alive", acc
 
         except Exception as e:
@@ -819,12 +1209,13 @@ async def import_string_session(session_string: str, hint: str = "") -> Optional
 
     write_meta(dest, api_id=API_ID, api_hash=API_HASH, phone=phone,
                **ANDROID_PROFILE)
+    await persist_session_bundle(dest)
     state, acc = await probe_and_register(dest)
     return acc if state == "alive" else None
 
 
 async def load_all_sessions(progress=None) -> dict:
-    """Load every account from the sessions folder. The folder is the truth."""
+    """Load every account from the MongoDB-restored working directory."""
     logger.info("Loading accounts from sessions/ ...")
     files = sorted(
         os.path.join(SESSIONS_DIR, f)
@@ -860,6 +1251,7 @@ async def load_all_sessions(progress=None) -> dict:
             await asyncio.sleep(0.3)
         try:
             os.replace(string_file, string_file + ".imported")
+            await storage_delete(_storage_name("sessions", "string.txt"))
         except Exception:
             pass
 
@@ -3114,7 +3506,7 @@ async def show_menu(event, user_id, edit=True):
         field(E_GREEN, "Status", S("Online 24/7")),
         "",
         f"{E_TARGET} {S('Choose an action below')}",
-    ], footer=f"{E_DIAMOND} {S('Sessions load from the sessions folder')}")
+    ], footer=f"{E_DIAMOND} {S('Sessions restore from MongoDB; local files are only a working cache')}")
 
     if is_owner:
         buttons = [
@@ -3616,7 +4008,7 @@ async def show_help(event):
         f"  {S('Real view counter increment. Works on public and private posts.')}",
         "",
         f"{E_PERSON} <b>{S('Accounts')}</b>",
-        f"  {S('Sessions load from the sessions folder. Import a ZIP of .session files or log in by phone.')}",
+        f"  {S('Sessions restore from MongoDB. Import a ZIP of .session files or log in by phone; the local copy syncs automatically.')}",
         "",
         f"{E_PAGE} <b>{S('Link formats')}</b>",
         f"  <code>https://t.me/channel/123</code>",
@@ -3626,7 +4018,13 @@ async def show_help(event):
 
 
 # ═══════════════════════ BOT ═══════════════════════
-bot = TelegramClient(os.path.join(BASE_DIR, "bot_session"), API_ID, API_HASH)
+# bot_session.session is also restored from/persisted to GridFS. Only the local
+# working path is passed to Telethon.
+# Telethon validates api_id/hash at client construction time. Use harmless
+# placeholders only so static tooling can import this module without env vars;
+# main() refuses to start until the real Config Vars are present.
+bot = TelegramClient(BOT_SESSION_BASE, API_ID or 1,
+                     API_HASH or "missing-api-hash")
 bot.parse_mode = "html"
 
 
@@ -3778,7 +4176,7 @@ async def route_callback(event, uid, owner, data):
         reason = PROBLEM_SESSIONS.get(stem, "unknown")
         sess_path = os.path.join(SESSIONS_DIR, stem + ".session")
         if os.path.exists(sess_path):
-            moved = to_trash(sess_path)
+            moved = await to_trash(sess_path)
             PROBLEM_SESSIONS.pop(stem, None)
             await event.answer(f"Moved to trash ({moved} file(s))")
         else:
@@ -3907,7 +4305,7 @@ async def route_callback(event, uid, owner, data):
         if not acc:
             return await event.answer("Account not found", alert=True)
         await disconnect_account(key)
-        moved = to_trash(acc.path)
+        moved = await to_trash(acc.path)
         ACCOUNTS.pop(key, None)
         invalidate_peer_cache()
         logger.info(f"removed {key}: {moved} file(s) -> trash")
@@ -3918,7 +4316,7 @@ async def route_callback(event, uid, owner, data):
         return await show_trash(event)
 
     if data == "trash_restore":
-        n = restore_from_trash()
+        n = await restore_from_trash()
         await event.answer(f"{n} restored")
         if n:
             await load_all_sessions()
@@ -3949,6 +4347,7 @@ async def route_callback(event, uid, owner, data):
                 if os.path.exists(p):
                     try:
                         os.unlink(p)
+                        await storage_delete(_storage_name("trash", os.path.basename(p)))
                         deleted += 1
                     except Exception as e:
                         logger.warning(f"clear trash {p}: {e}")
@@ -4016,7 +4415,7 @@ async def route_callback(event, uid, owner, data):
             if not acc:
                 continue
             await disconnect_account(key)
-            to_trash(acc.path)
+            await to_trash(acc.path)
             ACCOUNTS.pop(key, None)
             removed += 1
         invalidate_peer_cache()
@@ -4064,7 +4463,7 @@ async def route_callback(event, uid, owner, data):
         return await safe_edit(event, card(E_PLUS, "Add Account", [
             S("Log in with a phone number, or paste a Telethon string session."),
             "",
-            f"{E_SHIELD} {S('Either way the login is saved into the sessions folder.')}",
+            f"{E_SHIELD} {S('Either way the login is saved in MongoDB and restored after a dyno restart.')}",
         ]), [[btn("Phone Login", "add_phone", icon="📱"),
               btn("String Session", "add_string", icon="🔑")],
              [btn("Back", "menu_accounts", icon="⬅️")]])
@@ -4392,6 +4791,7 @@ async def route_callback(event, uid, owner, data):
     if data == "audio_del":
         try:
             os.unlink(LIVE_AUDIO_PATH)
+            await storage_delete("audio/live.mp3")
             await event.answer("Audio removed")
         except FileNotFoundError:
             await event.answer("No audio was set")
@@ -4863,6 +5263,8 @@ async def on_message(event):
             # Only replace the live file once the download finished, so a
             # failed transfer cannot leave accounts with a truncated track.
             os.replace(tmp, LIVE_AUDIO_PATH)
+            await storage_put_path("audio/live.mp3", LIVE_AUDIO_PATH, kind="audio",
+                                   force=True)
             size = os.path.getsize(LIVE_AUDIO_PATH) / (1024 * 1024)
         except Exception as e:
             return await msg.edit(card(E_CROSS, "Save Failed", [
@@ -5433,6 +5835,7 @@ async def finish_login(event, state):
     write_meta(path, api_id=API_ID, api_hash=API_HASH, phone=state["phone"],
                user_id=getattr(me, "id", 0), first_name=getattr(me, "first_name", ""),
                **ANDROID_PROFILE)
+    await persist_session_bundle(path)
     # hand the live client over to the store without reopening the file
     stem = os.path.splitext(os.path.basename(path))[0]
     acc = Account(stem, path, API_ID, API_HASH, dict(ANDROID_PROFILE))
@@ -5466,7 +5869,7 @@ async def finish_login(event, state):
         schedule_onboarding([acc.key], notify=event.chat_id)
         lines += ["", f"{E_REFRESH} {S('Joining it to all client channels in the background...')}"]
     await event.respond(card(E_CHECK, "Account Added", lines,
-                             footer=f"{E_SHIELD} {S('Saved into the sessions folder.')}"),
+                             footer=f"{E_SHIELD} {S('Saved in MongoDB; the dyno disk is only a temporary cache.')}"),
                         buttons=buttons)
 
 
@@ -5774,7 +6177,7 @@ async def handle_zip_import(event):
             field(E_PAGE, "Session files", str(len(found))),
             field(E_LOCK, "String sessions", str(len(strings))),
             "",
-            S("Copying into the sessions folder..."),
+            S("Copying into the MongoDB-backed session store..."),
         ]), force=True)
 
         stats = {"alive": 0, "dead": 0, "unknown": 0, "no_meta": 0,
@@ -5823,6 +6226,9 @@ async def handle_zip_import(event):
                        user_id=meta_get(meta, "user_id") or 0,
                        first_name=meta_get(meta, "first_name") or "",
                        phone=meta_get(meta, "phone") or "", **device)
+            # Persist even an account that later needs review so an ephemeral
+            # dyno restart never loses the imported credential file.
+            await persist_session_bundle(dest)
 
             # NB: do not call this `state` — that name is the import flow's own
             # variable and shadowing it here broke nothing yet only by luck.
@@ -5893,23 +6299,43 @@ async def main():
     print("=" * 58)
     print("  REACTION & VIEWS BOT")
     print("=" * 58)
-    print(f"  sessions dir : {SESSIONS_DIR}")
+    print(f"  runtime dir  : {RUNTIME_ROOT}")
     print(f"  owners       : {OWNER_IDS}")
+
+    if CONFIG_MISSING:
+        print("  configuration: missing " + ", ".join(CONFIG_MISSING))
+        print("  Set Heroku Config Vars; secrets are intentionally not in view.py.")
+        return
+    if mongo_client is None or mdb is None:
+        print("  mongodb      : client could not be created")
+        return
 
     try:
         await mongo_client.admin.command("ping")
-        print("  mongodb      : connected (clients only)")
-    except Exception as e:
-        print(f"  mongodb      : FAILED - {e}")
+        await ensure_database_indexes()
+        # First import an existing VPS copy only when MongoDB does not already
+        # have that object, then restore the canonical MongoDB copy. This makes
+        # the same code safe for both the one-time migration and every restart.
+        await migrate_legacy_storage_if_needed()
+        await restore_runtime_storage()
+        print("  mongodb      : connected (clients + GridFS runtime storage)")
+    except Exception as exc:
+        print(f"  mongodb      : FAILED - {exc}")
         return
 
     await load_settings()
-    await bot.start(bot_token=BOT_TOKEN)
-    me = await bot.get_me()
+    try:
+        await bot.start(bot_token=BOT_TOKEN)
+        me = await bot.get_me()
+    except Exception as exc:
+        print(f"  telegram bot  : FAILED - {exc}")
+        return
     print(f"  bot          : @{me.username}")
     print("=" * 58)
 
     tally = await load_all_sessions()
+    # Persist metadata written during the probe before any worker starts.
+    await sync_runtime_storage()
     print(f"  accounts     : {acc_count()} online "
           f"(dead {tally['dead']}, unclear {tally['unknown']})")
     if PROBLEM_SESSIONS:
@@ -5917,6 +6343,7 @@ async def main():
               f"(nothing deleted — see Accounts > Needs Review)")
 
     await setup_channel_monitors()
+    asyncio.create_task(runtime_storage_task())
     asyncio.create_task(monitor_task())
     asyncio.create_task(livestream_watch_task())
     asyncio.create_task(live_keepalive_task())
@@ -5927,7 +6354,7 @@ async def main():
 
     if not TGCALLS_OK:
         print(f"  live audio   : UNAVAILABLE — {TGCALLS_ERR}")
-        print("                 pip install py-tgcalls && apt install -y ffmpeg")
+        print("                 install py-tgcalls and the ffmpeg Apt buildpack")
     elif not os.path.exists(LIVE_AUDIO_PATH):
         print("  live audio   : no file set (Home > Audio > Set Audio)")
     else:
@@ -5941,9 +6368,28 @@ async def main():
                if LIVE_ROTATE else "off")
         print(f"  rotation     : {rot}")
 
-    print("  status       : ready")
+    print("  status       : ready; MongoDB is the persistence layer")
     print("=" * 58)
-    await bot.run_until_disconnected()
+
+    # Heroku sends SIGTERM before replacing a dyno. Ask Telethon to disconnect
+    # cleanly so the final GridFS sync below gets a chance to run.
+    loop = asyncio.get_running_loop()
+    def request_shutdown():
+        asyncio.create_task(bot.disconnect())
+    for shutdown_signal in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(shutdown_signal, request_shutdown)
+        except (NotImplementedError, RuntimeError):
+            pass
+    try:
+        await bot.run_until_disconnected()
+    finally:
+        try:
+            await sync_runtime_storage()
+        except Exception as exc:
+            logger.error("final runtime storage sync failed: %s", exc)
+        if mongo_client is not None:
+            mongo_client.close()
 
 
 if __name__ == "__main__":

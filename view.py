@@ -66,6 +66,7 @@ from telethon.tl.types import (
 )
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorGridFSBucket
 from bson.objectid import ObjectId
+from pymongo import InsertOne, UpdateOne
 
 # Optional so the bot still boots on a host without ffmpeg/ntgcalls; every
 # live-audio path checks TGCALLS_OK first and reports the missing dependency
@@ -772,56 +773,78 @@ async def storage_delete(name: str) -> bool:
     return True
 
 
-async def delete_all_account_session_storage() -> dict:
-    """Delete all user-session objects in one MongoDB batch.
+async def move_problem_session_storage_to_trash(stems: List[str]) -> dict:
+    """Move only the listed problem sessions to MongoDB/GridFS trash.
 
-    Moving one file at a time through GridFS requires a download, upload and
-    delete for every account. With 202 accounts that makes a callback appear
-    frozen and lets its query expire. This operation deletes the GridFS chunks,
-    files and manifests in bulk, then clears only stale client membership keys.
-    Client packages and subscriptions remain intact.
+    GridFS has no rename operation, but its chunks are independent of the
+    filename. Updating the GridFS filenames and replacing the small manifest
+    documents lets this bulk action move hundreds of sessions without copying
+    their bytes or touching healthy accounts.
     """
     if mdb is None or col_storage is None or storage_lock is None:
-        return {"files": 0, "bytes": 0, "memberships": 0}
+        return {"entries": 0, "files": 0, "bytes": 0}
+
+    stems = list(dict.fromkeys(stems))
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    extensions = (".session", ".json", ".session-journal",
+                  ".session-wal", ".session-shm")
+    source_to_destination = {}
+    for stem in stems:
+        for ext in extensions:
+            source = f"sessions/{stem}{ext}"
+            destination = f"trash/{stem}_{stamp}{ext}"
+            source_to_destination[source] = destination
 
     async with storage_lock:
-        docs = await col_storage.find({
-            "_id": {"$regex": r"^(sessions|trash)/"}
-        }, {"_id": 1, "gridfs_id": 1, "size": 1}).to_list(length=None)
-        ids = [d["gridfs_id"] for d in docs if d.get("gridfs_id")]
-        if ids:
-            # Delete chunks before file metadata. Both are MongoDB bulk calls,
-            # so the operation is seconds rather than one network round-trip
-            # per session.
-            await mdb[f"{GRIDFS_BUCKET}.chunks"].delete_many(
-                {"files_id": {"$in": ids}})
-            await mdb[f"{GRIDFS_BUCKET}.files"].delete_many(
-                {"_id": {"$in": ids}})
-        await col_storage.delete_many({
-            "_id": {"$regex": r"^(sessions|trash)/"}
-        })
+        source_names = list(source_to_destination)
+        docs = await col_storage.find(
+            {"_id": {"$in": source_names}},
+            {"_id": 1, "gridfs_id": 1, "size": 1, "kind": 1},
+        ).to_list(length=None)
+        file_ops = []
+        manifest_docs = []
+        for doc in docs:
+            source = doc["_id"]
+            destination = source_to_destination[source]
+            if doc.get("gridfs_id"):
+                file_ops.append(UpdateOne(
+                    {"_id": doc["gridfs_id"]},
+                    {"$set": {"filename": destination}},
+                ))
+            moved_doc = dict(doc)
+            moved_doc["_id"] = destination
+            moved_doc["kind"] = "trash"
+            moved_doc["updated_at"] = utcnow()
+            manifest_docs.append(moved_doc)
 
-    # The local copy is disposable on Heroku; remove it too so a reload in the
-    # same dyno cannot show the deleted accounts.
-    for directory in (SESSIONS_DIR, TRASH_DIR):
-        for root, _dirs, filenames in os.walk(directory):
-            for filename in filenames:
-                if filename.endswith((".session", ".json", ".session-journal",
-                                      ".session-wal", ".session-shm")):
-                    try:
-                        os.unlink(os.path.join(root, filename))
-                    except FileNotFoundError:
-                        pass
+        if file_ops:
+            await mdb[f"{GRIDFS_BUCKET}.files"].bulk_write(
+                file_ops, ordered=False)
+        if manifest_docs:
+            await col_storage.bulk_write(
+                [InsertOne(doc) for doc in manifest_docs], ordered=False)
+            await col_storage.delete_many(
+                {"_id": {"$in": [doc["_id"] for doc in docs]}})
+
+    # Move the disposable local mirror using the same timestamped names.
+    moved_local = 0
+    for source, destination in source_to_destination.items():
+        source_path = os.path.join(SESSIONS_DIR, source[len("sessions/"):])
+        destination_path = os.path.join(TRASH_DIR, destination[len("trash/"):])
+        if not os.path.exists(source_path):
+            continue
+        os.makedirs(os.path.dirname(destination_path), exist_ok=True)
+        try:
+            os.replace(source_path, destination_path)
+            moved_local += 1
+        except OSError as exc:
+            logger.warning("problem session trash move %s: %s", source_path, exc)
     _LOCAL_UPLOAD_FINGERPRINTS.clear()
-
-    membership_result = await col_clients.update_many(
-        {"joined_accounts": {"$exists": True}},
-        {"$set": {"joined_accounts": []}},
-    )
     return {
+        "entries": len(stems),
         "files": len(docs),
-        "bytes": sum(int(d.get("size", 0) or 0) for d in docs),
-        "memberships": membership_result.modified_count,
+        "bytes": sum(int(doc.get("size", 0) or 0) for doc in docs),
+        "local_files": moved_local,
     }
 
 
@@ -3828,7 +3851,7 @@ async def show_problem_sessions(event, page=1):
     # One bulk action prevents the owner from tapping dozens of callback buttons
     # at once. Each callback query is short-lived; the old per-row approach
     # expired while moving sessions to GridFS trash and produced QueryIdInvalid.
-    trash_buttons = [[btn("Delete All Sessions", "prob_rm_all_ask", style="danger")]]
+    trash_buttons = [[btn("Move All to Trash", "prob_rm_all_ask", style="danger")]]
     # Re-login + Trash per session so the owner can fix or clean each one
     for stem, _ in rows:
         trash_buttons.append([
@@ -4362,13 +4385,13 @@ async def route_callback(event, uid, owner, data):
     # ── Bulk remove problem sessions ──────────────────────────
     if data == "prob_rm_all_ask":
         count = len(PROBLEM_SESSIONS)
-        return await safe_edit(event, card(E_WARN, "Delete All Sessions", [
+        return await safe_edit(event, card(E_WARN, "Move All to Trash", [
             field(E_TRASH, "Problem sessions", str(count)),
             "",
-            S("This permanently removes all user session files from MongoDB/GridFS."),
-            S("Clients, subscriptions, history and audio are preserved."),
-            S("New accounts must be added again with fresh OTP/2FA sessions."),
-        ]), [[btn("Yes, delete all", "prob_rm_all_do", style="danger"),
+            S("Only sessions currently shown in Needs Review will be moved."),
+            S("Healthy account sessions will not be touched."),
+            S("Clients and subscriptions are preserved; sessions can be restored from Trash."),
+        ]), [[btn("Yes, move all", "prob_rm_all_do", style="danger"),
               btn("Cancel", "problem_sessions", icon="↩️")]])
 
     if data == "prob_rm_all_do":
@@ -4384,20 +4407,20 @@ async def route_callback(event, uid, owner, data):
             # local/remote session file.
             for key in list(acc_keys()):
                 await disconnect_account(key)
-            result = await delete_all_account_session_storage()
+            problem_stems = list(PROBLEM_SESSIONS)
+            result = await move_problem_session_storage_to_trash(problem_stems)
             PROBLEM_SESSIONS.clear()
-            ACCOUNTS.clear()
             invalidate_peer_cache()
             await setup_channel_monitors()
-            return await safe_edit(event, card(E_CHECK, "All Account Sessions Deleted", [
-                field(E_TRASH, "GridFS objects removed", str(result["files"])),
-                field(E_PAGE, "Data removed", f"{result['bytes'] / (1024 * 1024):.1f} MB"),
-                field(E_PERSON, "Client references cleared", str(result["memberships"])),
+            return await safe_edit(event, card(E_CHECK, "Problem Sessions Moved", [
+                field(E_TRASH, "Entries moved", str(result["entries"])),
+                field(E_PAGE, "GridFS files moved", str(result["files"])),
+                field(E_PERSON, "Healthy accounts kept", str(acc_count())),
                 "",
-                S("Client packages and subscriptions were preserved."),
-                S("Add fresh accounts from Accounts > Add Account."),
+                S("Only Needs Review sessions were moved to trash."),
+                S("Clients, subscriptions and healthy account sessions were preserved."),
             ]), [[btn("Accounts", "menu_accounts", icon="👤"),
-                   btn("Clients", "manage_clients", icon="📋")],
+                   btn("Trash", "trash_menu", icon="🗑")],
                   [btn("Home", "home", icon="🏠")]])
         finally:
             _PROBLEM_PURGE_RUNNING = False

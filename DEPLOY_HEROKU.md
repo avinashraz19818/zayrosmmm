@@ -144,7 +144,53 @@ settings and `audio/live.mp3`. Add new accounts later through the bot's normal
 login/import flow. Do not use the bot UI's many `prob_rm_*` buttons at once;
 callback queries expire and are not a bulk-delete mechanism.
 
-## 5. First-boot checks
+## Account workers: one worker per 10 accounts
+
+Heroku does not automatically create workers from an app variable. This version
+adds MongoDB-backed shard ownership and optional Heroku Formation API scaling:
+
+- `worker.1` is the controller and owns shard 0;
+- each worker owns at most `ACCOUNT_SHARD_SIZE` sessions (default 10);
+- a session is claimed with a MongoDB lease, so two new workers cannot open the
+  same SQLite session at the same time;
+- the controller calculates `ceil(session_count / 10)` and asks Heroku to scale;
+- new sessions are assigned to a shard on the next reconciliation sweep.
+
+For automatic scaling, create a Heroku Platform API key in your Heroku account
+and set these Config Vars (never put the key in Git):
+
+```text
+ACCOUNT_SHARDING=true
+ACCOUNT_SHARD_SIZE=10
+HEROKU_APP_NAME=YOUR-APP-NAME
+HEROKU_API_KEY=YOUR-HEROKU-PLATFORM-API-KEY
+```
+
+The API key is optional for safety; without it the app logs the required worker
+count and you can scale manually. Each extra worker is a separately billed dyno.
+Do not simply scale workers while an old VPS copy is running: the old VPS copy
+does not know the MongoDB shard lease and will open every session.
+
+### Safe migration/redeploy order
+
+1. Stop the old VPS bot and confirm no `python view.py` process remains. Do not
+delete its files.
+2. Scale the Heroku worker to zero while deploying or changing formation:
+   `heroku ps:scale worker=0 -a YOUR-APP-NAME`.
+3. Deploy the new branch/build.
+4. Set the Config Vars above and verify the worker formation is the desired
+   `ceil(accounts / 10)` count.
+5. Start the Heroku workers: `heroku ps:scale worker=N -a YOUR-APP-NAME`.
+6. Watch logs. Each worker should report a different slot and at most ten
+   session shard(s). Only after this is healthy should the bot be used.
+7. To move to another Heroku app, stop/scale the old app to zero first, copy the
+   same Mongo Config Vars to the new app, deploy it, and then start the new
+   formation. MongoDB remains the data source; no session copy is needed.
+
+Never run old VPS plus new Heroku workers at the same time with the same
+Telegram sessions. Telegram can revoke the auth keys as duplicate sessions.
+
+## 6. First-boot checks
 
 In the logs, confirm these lines (wording may include timestamps):
 

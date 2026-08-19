@@ -26,6 +26,8 @@ import signal
 import sqlite3
 import tempfile
 import time
+import urllib.request
+import urllib.error
 from html import escape as esc
 from math import ceil
 from typing import Dict, List, Optional, Tuple
@@ -159,7 +161,38 @@ SESSION_CONNECT_CONCURRENCY = max(4, _env_int("SESSION_CONNECT_CONCURRENCY", 12)
 ZIP_IMPORT_CONCURRENCY = max(4, _env_int("ZIP_IMPORT_CONCURRENCY", 12))
 SESSION_PROBE_TIMEOUT = max(30, _env_int("SESSION_PROBE_TIMEOUT", 60))
 
+# ── Account worker sharding ────────────────────────────────────────────────
+# On Heroku, DYNO is worker.1, worker.2, ... . Each worker owns at most ten
+# Telegram sessions. The shard map and leases live in MongoDB, so a restart or
+# move to another Heroku app cannot make two workers open the same session.
+ACCOUNT_SHARDING = os.getenv("ACCOUNT_SHARDING", "true").strip().lower() not in {
+    "0", "false", "no", "off",
+}
+ACCOUNT_SHARD_SIZE = max(1, _env_int("ACCOUNT_SHARD_SIZE", 10))
+HEROKU_APP_NAME = os.getenv("HEROKU_APP_NAME", "").strip()
+HEROKU_API_KEY = os.getenv("HEROKU_API_KEY", "").strip()
+WORKER_RECONCILE_INTERVAL = max(30, _env_int("WORKER_RECONCILE_INTERVAL", 60))
+DYNO_NAME = os.getenv("DYNO", "").strip()
+
+
+def worker_slot_from_dyno(dyno: str) -> int:
+    match = re.search(r"(?:worker|account_worker)\.(\d+)$", dyno or "")
+    return max(0, int(match.group(1)) - 1) if match else 0
+
+
+WORKER_SLOT = worker_slot_from_dyno(DYNO_NAME)
+# Include the PID so a rolling restart with the same DYNO name cannot share a
+# lease with the previous process.
+WORKER_INSTANCE_ID = f"{DYNO_NAME or 'local-worker'}.{os.getpid()}"
+# Only worker.1 polls bot updates and sends reminders. Account workers run
+# their assigned user sessions and Telegram channel monitors.
+IS_CONTROLLER_WORKER = WORKER_SLOT == 0
+SHARD_LEASE_SECONDS = 120
+
 # Every live audio stream costs an ffmpeg process, a WebRTC connection and a
+# second MTProto socket. The usual 1024-descriptor default runs out partway
+# through a large fleet, and the first casualty is Telethon's session sqlite —
+# so accounts start dropping for a reason that looks nothing like the cause., a WebRTC connection and a
 # second MTProto socket. The usual 1024-descriptor default runs out partway
 # through a large fleet, and the first casualty is Telethon's session sqlite —
 # so accounts start dropping for a reason that looks nothing like the cause.
@@ -309,6 +342,11 @@ PEER_CACHE: Dict[Tuple[str, str], object] = {}
 # (mtime_ns, size) -> (valid, reason), so ten live accounts do not each run a
 # separate 30-second ffprobe for the same audio file.
 AUDIO_VALIDATION_CACHE: Optional[Tuple[int, int, bool, str]] = None
+# Remote session filename -> assigned worker slot, and account key -> slot.
+WORKER_SESSION_NAMES: Optional[set] = None
+ACCOUNT_SLOT_BY_KEY: Dict[str, int] = {}
+ACCOUNT_REMOTE_BY_KEY: Dict[str, str] = {}
+_SHARD_RECONCILE_RUNNING = False
 
 
 # ═══════════════════════ TEXT STYLING ═══════════════════════
@@ -575,13 +613,15 @@ col_stats = None
 col_settings = None
 storage_bucket = None
 col_storage = None
+col_account_shards = None
 storage_lock = None
 
 
 def initialize_mongo_client():
     """Create Motor/GridFS objects on the current event loop."""
     global mongo_client, mdb, col_history, col_approved, col_clients
-    global col_stats, col_settings, storage_bucket, col_storage, storage_lock
+    global col_stats, col_settings, storage_bucket, col_storage
+    global col_account_shards, storage_lock
     if mongo_client is not None:
         return
     mongo_client = AsyncIOMotorClient(
@@ -602,6 +642,7 @@ def initialize_mongo_client():
     # runtime data.
     storage_bucket = AsyncIOMotorGridFSBucket(mdb, bucket_name=GRIDFS_BUCKET)
     col_storage = mdb["storage_manifest"]
+    col_account_shards = mdb["account_shards"]
     storage_lock = asyncio.Lock()
     logger.info("MongoDB/GridFS client created")
 
@@ -876,6 +917,28 @@ async def persist_session_bundle(session_path: str):
         await storage_put_path(_session_remote_name(sidecar), sidecar, "session_meta")
 
 
+def worker_owns_runtime_object(name: str) -> bool:
+    """Whether this dyno may materialise a remote runtime object."""
+    if not sharding_runtime_enabled() or WORKER_SESSION_NAMES is None:
+        return True
+    if name.startswith("sessions/"):
+        filename = name[len("sessions/"):]
+        if filename.endswith(".session"):
+            session_name = name
+        elif ".session" in filename:
+            session_name = "sessions/" + filename.split(".session", 1)[0] + ".session"
+        elif filename.endswith(".json"):
+            session_name = "sessions/" + filename[:-len(".json")] + ".session"
+        else:
+            return False
+        return session_name in WORKER_SESSION_NAMES
+    # Only the controller needs trash files for its admin screen. The bot uses
+    # MemorySession, so account workers do not need the old bot SQLite copy.
+    if name.startswith("trash/") or name.startswith("bot/"):
+        return IS_CONTROLLER_WORKER
+    return True
+
+
 async def restore_runtime_storage():
     """Restore all remote runtime objects into the ephemeral working tree."""
     if col_storage is None:
@@ -888,6 +951,8 @@ async def restore_runtime_storage():
 
     async def restore(document):
         name = document["_id"]
+        if not worker_owns_runtime_object(name):
+            return
         if name.startswith("sessions/"):
             target = os.path.join(SESSIONS_DIR, name[len("sessions/"):])
         elif name.startswith("trash/"):
@@ -981,6 +1046,236 @@ async def ensure_database_indexes():
     await col_history.create_index([("timestamp", -1)])
     await col_approved.create_index("user_id")
     await col_storage.create_index("gridfs_id")
+    await col_account_shards.create_index([("slot", 1), ("owner", 1)])
+
+
+_LAST_HEROKU_WORKER_TARGET: Optional[int] = None
+
+
+def sharding_runtime_enabled() -> bool:
+    """Enable account sharding on Heroku dynos, not on the old single VPS."""
+    return ACCOUNT_SHARDING and bool(DYNO_NAME)
+
+
+async def heroku_scale_workers(quantity: int):
+    """Ask the Heroku Formation API for the required worker count.
+
+    The API key is optional. Without it the app remains safe and logs the
+    manual scale command instead of failing startup.
+    """
+    global _LAST_HEROKU_WORKER_TARGET
+    quantity = max(1, int(quantity))
+    if not IS_CONTROLLER_WORKER:
+        return
+    if _LAST_HEROKU_WORKER_TARGET == quantity:
+        return
+    if not HEROKU_APP_NAME or not HEROKU_API_KEY:
+        logger.warning(
+            "Account sharding needs %s worker(s). Set HEROKU_APP_NAME and "
+            "HEROKU_API_KEY for automatic scaling; manual command: "
+            "heroku ps:scale worker=%s",
+            quantity, quantity,
+        )
+        _LAST_HEROKU_WORKER_TARGET = quantity
+        return
+
+    def patch_formation():
+        url = f"https://api.heroku.com/apps/{HEROKU_APP_NAME}/formation/worker"
+        body = json.dumps({"quantity": quantity}).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=body,
+            method="PATCH",
+            headers={
+                "Authorization": f"Bearer {HEROKU_API_KEY}",
+                "Accept": "application/vnd.heroku+json; version=3",
+                "Content-Type": "application/json",
+            },
+        )
+        with urllib.request.urlopen(request, timeout=20) as response:
+            return response.status
+
+    try:
+        status = await asyncio.to_thread(patch_formation)
+        _LAST_HEROKU_WORKER_TARGET = quantity
+        logger.info("Heroku formation requested: worker=%s (HTTP %s)",
+                    quantity, status)
+    except Exception as exc:
+        logger.error("Heroku auto-scale to worker=%s failed: %s", quantity, exc)
+
+
+async def _infer_account_key(session_name: str) -> str:
+    """Read a stable account key from the JSON sidecar without opening Telegram."""
+    stem = session_name[len("sessions/"):-len(".session")]
+    try:
+        raw = await storage_get_bytes(session_name[:-len(".session")] + ".json")
+        if raw:
+            meta = json.loads(raw.decode("utf-8"))
+            phone = str(meta_get(meta, "phone") or "").strip()
+            if phone:
+                return phone if phone.startswith("+") else f"+{phone}"
+            user_id = meta_get(meta, "user_id")
+            if user_id:
+                return f"id_{user_id}"
+    except Exception:
+        pass
+    return stem
+
+
+async def reconcile_account_shards() -> set:
+    """Assign every remote session to one worker slot and claim this slot's files."""
+    global WORKER_SESSION_NAMES, ACCOUNT_SLOT_BY_KEY, ACCOUNT_REMOTE_BY_KEY
+    if not sharding_runtime_enabled() or col_storage is None or col_account_shards is None:
+        WORKER_SESSION_NAMES = None
+        return set()
+
+    session_docs = await col_storage.find(
+        {"_id": {"$regex": r"^sessions/.*\\.session$"}},
+        {"_id": 1},
+    ).sort("_id", 1).to_list(length=None)
+    names = [doc["_id"] for doc in session_docs]
+    desired_workers = max(1, ceil(len(names) / ACCOUNT_SHARD_SIZE))
+    await heroku_scale_workers(desired_workers)
+
+    existing_docs = await col_account_shards.find(
+        {"_id": {"$in": names}}
+    ).to_list(length=None) if names else []
+    existing = {doc["_id"]: doc for doc in existing_docs}
+
+    # Sidecar reads are small; do them in bounded parallelism.
+    sem = asyncio.Semaphore(20)
+
+    async def key_for(name):
+        async with sem:
+            return name, await _infer_account_key(name)
+
+    key_pairs = await asyncio.gather(*(key_for(name) for name in names))
+    key_by_name = dict(key_pairs)
+    counts = [0] * desired_workers
+    assignments = {}
+
+    for name in names:
+        old = existing.get(name, {})
+        try:
+            old_slot = int(old.get("slot"))
+        except (TypeError, ValueError):
+            old_slot = -1
+        if 0 <= old_slot < desired_workers and counts[old_slot] < ACCOUNT_SHARD_SIZE:
+            slot = old_slot
+        else:
+            available = [i for i, count in enumerate(counts)
+                         if count < ACCOUNT_SHARD_SIZE]
+            slot = min(available, key=lambda i: counts[i]) if available else desired_workers - 1
+        counts[slot] += 1
+        assignments[name] = slot
+
+    now = utcnow()
+    writes = []
+    for name, slot in assignments.items():
+        old = existing.get(name, {})
+        fields = {
+            "slot": slot,
+            "account_key": key_by_name[name],
+            "updated_at": now,
+        }
+        if old.get("slot") != slot:
+            # If an old worker owns this file, give it a short handoff window to
+            # release the SQLite connection before the new slot claims it.
+            fields["handoff_until"] = now + datetime.timedelta(seconds=30)
+        writes.append(UpdateOne({"_id": name}, {"$set": fields}, upsert=True))
+    if writes:
+        await col_account_shards.bulk_write(writes, ordered=False)
+
+    assigned = {name for name, slot in assignments.items() if slot == WORKER_SLOT}
+    await col_account_shards.update_many(
+        {"owner": WORKER_INSTANCE_ID,
+         "_id": {"$nin": list(assigned)} if assigned else {"$exists": True}},
+        {"$set": {"owner": None, "lease_until": None}},
+    )
+
+    claimed = set()
+    for name in assigned:
+        query = {
+            "_id": name,
+            "slot": WORKER_SLOT,
+            "$and": [
+                {"$or": [
+                    {"owner": {"$exists": False}},
+                    {"owner": None},
+                    {"owner": WORKER_INSTANCE_ID},
+                    {"$and": [
+                        {"lease_until": {"$lt": now}},
+                        {"$or": [
+                            {"handoff_until": {"$exists": False}},
+                            {"handoff_until": {"$lte": now}},
+                        ]},
+                    ]},
+                ]},
+            ],
+        }
+        result = await col_account_shards.update_one(
+            query,
+            {"$set": {"owner": WORKER_INSTANCE_ID,
+                      "lease_until": now + datetime.timedelta(seconds=SHARD_LEASE_SECONDS)}},
+        )
+        if result.matched_count:
+            claimed.add(name)
+
+    ACCOUNT_SLOT_BY_KEY = {
+        key_by_name[name]: assignments[name]
+        for name in names if name in assignments
+    }
+    ACCOUNT_REMOTE_BY_KEY = {
+        key_by_name[name]: name for name in names if name in assignments
+    }
+    WORKER_SESSION_NAMES = claimed
+    logger.info("Worker %s owns %s/%s session shard(s); formation target=%s",
+                WORKER_INSTANCE_ID, len(claimed), len(names), desired_workers)
+    return claimed
+
+
+async def release_worker_shards():
+    if not sharding_runtime_enabled() or col_account_shards is None:
+        return
+    await col_account_shards.update_many(
+        {"owner": WORKER_INSTANCE_ID},
+        {"$set": {"owner": None, "lease_until": None}},
+    )
+
+
+async def worker_shard_reconcile_task():
+    """Refresh leases and pick up accounts added through the controller worker."""
+    while True:
+        await asyncio.sleep(WORKER_RECONCILE_INTERVAL)
+        if not sharding_runtime_enabled():
+            continue
+        try:
+            before = set(WORKER_SESSION_NAMES or set())
+            after = await reconcile_account_shards()
+            if after != before:
+                await restore_runtime_storage()
+                # Disconnect sessions that moved away from this slot.
+                allowed_stems = {os.path.splitext(os.path.basename(n))[0] for n in after}
+                for key, account in list(ACCOUNTS.items()):
+                    if account.stem not in allowed_stems:
+                        await disconnect_account(key)
+                        ACCOUNTS.pop(key, None)
+                # Probe only newly claimed local files, not all ten on every tick.
+                loaded_stems = {a.stem for a in ACCOUNTS.values()}
+                for name in after:
+                    stem = os.path.splitext(os.path.basename(name))[0]
+                    if stem not in loaded_stems:
+                        path = os.path.join(SESSIONS_DIR, f"{stem}.session")
+                        if os.path.exists(path):
+                            await probe_and_register(path)
+                await setup_channel_monitors()
+            else:
+                await col_account_shards.update_many(
+                    {"owner": WORKER_INSTANCE_ID},
+                    {"$set": {"lease_until": utcnow() + datetime.timedelta(seconds=SHARD_LEASE_SECONDS)}},
+                )
+        except Exception as exc:
+            logger.error("worker shard reconcile: %s", exc)
 
 
 # ═══════════════════════ ACCOUNT STORE (MongoDB-backed sessions) ═══════════════════════
@@ -1226,6 +1521,16 @@ async def probe_and_register(session_path: str) -> Tuple[str, Optional[Account]]
                        user_id=acc.user_id, phone=acc.phone,
                        first_name=acc.name, **device)
             await persist_session_bundle(session_path)
+            remote_name = _session_remote_name(session_path)
+            if sharding_runtime_enabled() and col_account_shards is not None:
+                await col_account_shards.update_one(
+                    {"_id": remote_name},
+                    {"$set": {"account_key": acc.key,
+                              "updated_at": utcnow()}},
+                    upsert=True,
+                )
+                ACCOUNT_SLOT_BY_KEY[acc.key] = WORKER_SLOT
+                ACCOUNT_REMOTE_BY_KEY[acc.key] = remote_name
             return "alive", acc
 
         except Exception as e:
@@ -2771,6 +3076,25 @@ async def get_allowed_reactions(key: str, client, peer) -> Optional[list]:
 
 
 # ═══════════════════════ AUTO REACT / VIEW ON NEW POSTS ═══════════════════════
+def local_worker_account(key: str) -> bool:
+    if not acc_client(key):
+        return False
+    if not sharding_runtime_enabled():
+        return True
+    # A key learned from a newly probed session is local until the next shard
+    # reconciliation; never let a worker use a key explicitly assigned away.
+    return ACCOUNT_SLOT_BY_KEY.get(key, WORKER_SLOT) == WORKER_SLOT
+
+
+def globally_ordered_joined(joined: list) -> list:
+    if not sharding_runtime_enabled():
+        return [key for key in joined if acc_client(key)]
+    return sorted(
+        list(dict.fromkeys(joined)),
+        key=lambda key: (ACCOUNT_SLOT_BY_KEY.get(key, 10**9), str(key)),
+    )
+
+
 async def process_new_post(channel_id: int, message_id: int):
     subs = await get_active_subscriptions_for_channel(channel_id)
     if not subs:
@@ -2781,7 +3105,7 @@ async def process_new_post(channel_id: int, message_id: int):
             await update_client_status(str(sub["_id"]), "expired")
             continue
 
-        joined = [k for k in sub.get("joined_accounts", []) if acc_client(k)]
+        joined = globally_ordered_joined(sub.get("joined_accounts", []))
         if not joined:
             logger.info(f"sub {sub['_id']}: no joined account is online")
             continue
@@ -2791,28 +3115,28 @@ async def process_new_post(channel_id: int, message_id: int):
         n_react = min(int(sub.get("reactions_per_post", 0) or 0), len(joined))
         n_views = min(int(sub.get("views_per_post", 0) or 0), len(joined))
 
-        # Least-recently-worked accounts first, so the load walks around the
-        # whole joined list instead of landing on whoever the dice picked. The
-        # view slice is taken after the react slice is marked busy, which makes
-        # the two lists prefer different accounts without forcing them apart:
-        # if the sub only has a handful joined, overlap is still allowed.
-        react_keys = pick_workers(joined, n_react)
+        # In sharded mode the package is selected globally, then each worker
+        # executes only the selected keys it owns. Without this split every
+        # worker would send the full package and multiply reactions/views by
+        # the number of workers.
+        global_react = joined[:n_react]
+        global_view = joined[:n_views]
+        react_keys = [k for k in global_react if local_worker_account(k)]
+        view_keys = [k for k in global_view if local_worker_account(k)]
         for k in react_keys:
             ACC_INFLIGHT[k] = ACC_INFLIGHT.get(k, 0) + 1
         try:
-            view_keys = pick_workers(joined, n_views)
+            view_keys = pick_workers(view_keys, len(view_keys))
         finally:
             for k in react_keys:
                 ACC_INFLIGHT[k] = max(0, ACC_INFLIGHT.get(k, 1) - 1)
 
-        # Anyone not picked is a stand-in. When a chosen account fails — flood
-        # wait, peer not resolvable, reaction rejected — the work is handed to
-        # one of these instead of being silently dropped. Without this a burst
-        # of posts delivered whatever happened to succeed, which is why some
-        # posts in the same minute got the full package and others got half.
-        react_spares = [k for k in pick_workers(joined, len(joined))
+        local_joined = [k for k in joined if local_worker_account(k)]
+        # A failure can only be retried by this worker's own shard; another
+        # worker must not open a session it does not own.
+        react_spares = [k for k in pick_workers(local_joined, len(local_joined))
                         if k not in react_keys]
-        view_spares = [k for k in pick_workers(joined, len(joined))
+        view_spares = [k for k in pick_workers(local_joined, len(local_joined))
                        if k not in view_keys]
 
         # Use the shared global semaphore so all concurrent process_new_post
@@ -2827,9 +3151,16 @@ async def process_new_post(channel_id: int, message_id: int):
             if probe_peer is not None:
                 allowed = await get_allowed_reactions(probe, acc_client(probe),
                                                       probe_peer)
-            for emoji, count in distribute_reactions(len(react_keys), allowed).items():
-                emoji_plan.extend([emoji] * count)
-            random.shuffle(emoji_plan)
+            global_plan = []
+            for emoji, count in distribute_reactions(n_react, allowed).items():
+                global_plan.extend([emoji] * count)
+            random.shuffle(global_plan)
+            # Preserve one reaction job per selected local account while the
+            # emoji distribution still represents the whole package.
+            index_by_key = {key: index for index, key in enumerate(global_react)}
+            emoji_plan = [global_plan[index_by_key[key]]
+                          for key in react_keys
+                          if index_by_key.get(key, n_react) < len(global_plan)]
 
         done = {"react": 0, "view": 0}
         spare_lock = asyncio.Lock()
@@ -2883,8 +3214,9 @@ async def process_new_post(channel_id: int, message_id: int):
             *[deliver("view", k, None, view_spares) for k in view_keys],
             return_exceptions=True)
 
-        await col_clients.update_one({"_id": sub["_id"]},
-                                     {"$inc": {"total_posts_processed": 1}})
+        if IS_CONTROLLER_WORKER:
+            await col_clients.update_one({"_id": sub["_id"]},
+                                         {"$inc": {"total_posts_processed": 1}})
         await increment_stats(reactions=done["react"], views=done["view"])
         # Report what actually landed, not what was planned. The old line
         # printed the plan, so a post that delivered half looked perfect in the
@@ -3325,7 +3657,14 @@ async def process_live_stream_start(channel_id: int, call):
                            f"{n_live} -> {LIVE_CAP} (Audio > Stream Limit)")
             n_live = live_limit(n_live)
 
-        joined = [k for k in sub.get("joined_accounts", []) if acc_client(k)]
+        joined_all = globally_ordered_joined(sub.get("joined_accounts", []))
+        if sharding_runtime_enabled():
+            # Select the subscription's live package globally, then let each
+            # worker stream only the selected accounts it owns.
+            global_live = joined_all[:min(n_live, len(joined_all))]
+            joined = [k for k in global_live if local_worker_account(k)]
+        else:
+            joined = [k for k in joined_all if acc_client(k)]
 
         # Another client may already be live and holding some of these. An
         # account can only sit in one group call, so those are gone for now.
@@ -3337,7 +3676,7 @@ async def process_live_stream_start(channel_id: int, call):
         # it the client would silently get half the accounts they paid for —
         # while dozens of accounts sat idle in other channels. Take the
         # least-busy free ones, join them, and they are members from now on.
-        if len(free) < n_live:
+        if len(free) < n_live and not sharding_runtime_enabled():
             need = n_live - len(free)
             load = await account_load()
             spare = [k for k in free_live_keys(acc_keys(), channel_id)
@@ -6626,20 +6965,27 @@ async def main():
         # have that object, then restore the canonical MongoDB copy. This makes
         # the same code safe for both the one-time migration and every restart.
         await migrate_legacy_storage_if_needed()
+        if sharding_runtime_enabled():
+            await reconcile_account_shards()
         await restore_runtime_storage()
         print("  mongodb      : connected (clients + GridFS runtime storage)")
+        if sharding_runtime_enabled():
+            print(f"  worker shard  : slot {WORKER_SLOT}, max {ACCOUNT_SHARD_SIZE} accounts")
     except Exception as exc:
         print(f"  mongodb      : FAILED - {exc}")
         return
 
     await load_settings()
-    try:
-        await bot.start(bot_token=BOT_TOKEN)
-        me = await bot.get_me()
-    except Exception as exc:
-        print(f"  telegram bot  : FAILED - {exc}")
-        return
-    print(f"  bot          : @{me.username}")
+    if IS_CONTROLLER_WORKER:
+        try:
+            await bot.start(bot_token=BOT_TOKEN)
+            me = await bot.get_me()
+        except Exception as exc:
+            print(f"  telegram bot  : FAILED - {exc}")
+            return
+        print(f"  bot          : @{me.username}")
+    else:
+        print(f"  account worker: slot {WORKER_SLOT} ({WORKER_INSTANCE_ID})")
     print("=" * 58)
 
     tally = await load_all_sessions()
@@ -6656,10 +7002,13 @@ async def main():
     asyncio.create_task(monitor_task())
     asyncio.create_task(livestream_watch_task())
     asyncio.create_task(live_keepalive_task())
-    asyncio.create_task(reminder_task())
-    asyncio.create_task(expiry_check_task())
+    if IS_CONTROLLER_WORKER:
+        asyncio.create_task(reminder_task())
+        asyncio.create_task(expiry_check_task())
     asyncio.create_task(keep_alive_task())
     asyncio.create_task(onboard_sweep_task())
+    if sharding_runtime_enabled():
+        asyncio.create_task(worker_shard_reconcile_task())
 
     if not TGCALLS_OK:
         print(f"  live audio   : UNAVAILABLE — {TGCALLS_ERR}")
@@ -6683,16 +7032,28 @@ async def main():
     # Heroku sends SIGTERM before replacing a dyno. Ask Telethon to disconnect
     # cleanly so the final GridFS sync below gets a chance to run.
     loop = asyncio.get_running_loop()
+    shutdown_event = asyncio.Event()
+
     def request_shutdown():
-        asyncio.create_task(bot.disconnect())
+        shutdown_event.set()
+        if IS_CONTROLLER_WORKER:
+            asyncio.create_task(bot.disconnect())
+
     for shutdown_signal in (signal.SIGTERM, signal.SIGINT):
         try:
             loop.add_signal_handler(shutdown_signal, request_shutdown)
         except (NotImplementedError, RuntimeError):
             pass
     try:
-        await bot.run_until_disconnected()
+        if IS_CONTROLLER_WORKER:
+            await bot.run_until_disconnected()
+        else:
+            await shutdown_event.wait()
     finally:
+        try:
+            await release_worker_shards()
+        except Exception as exc:
+            logger.error("worker lease release failed: %s", exc)
         try:
             await sync_runtime_storage()
         except Exception as exc:

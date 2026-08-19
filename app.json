@@ -49,6 +49,26 @@
     "STORAGE_SYNC_INTERVAL": {
       "description": "Runtime session sync interval in seconds",
       "value": "120"
+    },
+    "ACCOUNT_SHARDING": {
+      "description": "Use one account worker shard per up to ACCOUNT_SHARD_SIZE sessions",
+      "value": "true"
+    },
+    "ACCOUNT_SHARD_SIZE": {
+      "description": "Maximum Telegram account sessions owned by one worker",
+      "value": "10"
+    },
+    "HEROKU_APP_NAME": {
+      "description": "This Heroku app name, required for automatic worker scaling",
+      "required": false
+    },
+    "HEROKU_API_KEY": {
+      "description": "Heroku Platform API key used only by worker.1 to scale workers",
+      "required": false
+    },
+    "WORKER_RECONCILE_INTERVAL": {
+      "description": "Seconds between account shard/lease reconciliation",
+      "value": "60"
     }
   }
 }

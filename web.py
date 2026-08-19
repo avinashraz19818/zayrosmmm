@@ -54,7 +54,8 @@ document.querySelectorAll('[data-page]').forEach(a=>a.onclick=e=>{e.preventDefau
 async function dashboard(){let d=await get('/api/summary');if(!d)return;app.innerHTML=`<h1>Dashboard</h1><div class="cards"><div class="card"><div class="num">${d.total}</div><div class="label">Total accounts</div></div><div class="card"><div class="num green">${d.leased}</div><div class="label">Accounts online</div></div><div class="card"><div class="num yellow">${d.flood}</div><div class="label">Flood</div></div><div class="card"><div class="num red">${d.dead}</div><div class="label">Dead</div></div><div class="card"><div class="num red">${d.banned}</div><div class="label">Banned</div></div></div><div class="panel" style="margin-top:14px"><div class="workers"><strong>Workers: ${d.live_workers}/${d.workers} online</strong> &nbsp; ${d.slots.join(', ')||'none'}</div></div><h2>Voice chats</h2><div class="cards" style="grid-template-columns:repeat(4,1fr)"><div class="card"><div class="num">${d.voice.active}</div><div class="label">Active VCs</div></div><div class="card"><div class="num green">${d.voice.accounts}</div><div class="label">Accounts in use</div></div><div class="card"><div class="num">${d.voice.memberships}</div><div class="label">VC memberships</div></div><div class="card"><div class="num yellow">${d.voice.max_per_account}</div><div class="label">Max calls/account</div></div></div><h2>Recent tasks</h2><div class="panel"><table><thead><tr><th>When</th><th>Action</th><th>Progress</th><th>OK</th><th>Fail</th><th>Status</th></tr></thead><tbody>${d.tasks.map(t=>`<tr><td>${esc(t.when)}</td><td>${esc(t.action)}</td><td>${t.progress}%</td><td class="green">${t.ok}</td><td class="red">${t.fail}</td><td><span class="pill ${t.status==='done'?'ok':t.status==='failed'?'bad':''}">${esc(t.status)}</span></td></tr>`).join('')}</tbody></table></div>`;timer=setInterval(dashboard,10000)}
 function actionForm(title,action,fields){return `<div class="form"><h3>${title}</h3>${fields.map(f=>`<input id="${action}-${f[0]}" placeholder="${f[1]}" ${f[2]||''}>`).join('')}<button class="btn" onclick="runAction('${action}')">${title}</button></div>`}
 async function runAction(action){let p={};document.querySelectorAll(`[id^="${action}-"]`).forEach(x=>{p[x.id.slice(action.length+1)]=x.value});let d=await get('/api/actions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,params:p})});document.getElementById('result').innerHTML=d?`Queued task <b>${esc(d.id)}</b>`:''}
-async function actions(){app.innerHTML=`<h1>Actions</h1><div class="grid">${actionForm('Join','join',[['target','https://t.me/group']])}${actionForm('Leave','leave',[['target','chat id or link']])}${actionForm('Set name','set_name',[['name','John Doe']])}${actionForm('React','react',[['target','post link'],['emoji','emoji (optional)']])}${actionForm('Views','views',[['target','post link']])}${actionForm('Live start','live_start',[['target','channel link']])}<div class="form"><h3>Live controls</h3><button class="btn danger" onclick="runAction('live_stop')">Stop all live calls</button><br><br><button class="btn secondary" onclick="runAction('live_rotate')">Rotate live accounts</button></div></div><div id="result" class="result">Choose an action.</div>`}
+async function uploadPhoto(){let f=document.getElementById('photo-file').files[0];if(!f){document.getElementById('result').innerText='Choose a photo first';return}let fd=new FormData();fd.append('photo',f);let d=await get('/api/profile-photo',{method:'POST',body:fd});document.getElementById('result').innerText=d?`Queued task ${d.id}`:''}
+async function actions(){app.innerHTML=`<h1>Actions</h1><div class="grid">${actionForm('Join','join',[['target','https://t.me/group']])}${actionForm('Leave','leave',[['target','chat id or link']])}${actionForm('Set name','set_name',[['name','John Doe']])}${actionForm('Random names','random_names',[['names','Name One, Name Two, Name Three']])}${actionForm('React','react',[['target','post link'],['emoji','emoji (optional)']])}${actionForm('Views','views',[['target','post link']])}${actionForm('Live start','live_start',[['target','channel link']])}<div class="form"><h3>Profile photo</h3><input id="photo-file" type="file" accept="image/*"><button class="btn" onclick="uploadPhoto()">Set DP</button></div><div class="form"><h3>Live controls</h3><button class="btn danger" onclick="runAction('live_stop')">Stop all live calls</button><br><br><button class="btn secondary" onclick="runAction('live_rotate')">Rotate live accounts</button></div></div><div id="result" class="result">Choose an action.</div>`}
 async function sessions(){let d=await get('/api/sessions');app.innerHTML=`<h1>Sessions</h1><div class="panel"><table><thead><tr><th>Account</th><th>Worker</th><th>Status</th><th>Last update</th></tr></thead><tbody>${d.rows.map(x=>`<tr><td>${esc(x.account)}</td><td>worker.${x.slot+1}</td><td><span class="pill ${x.online?'ok':''}">${x.online?'online':'offline'}</span></td><td>${esc(x.updated)}</td></tr>`).join('')}</tbody></table></div>`}
 async function accounts(){return sessions()}
 async function plans(){let d=await get('/api/plans');app.innerHTML=`<h1>Plans</h1><div class="panel"><table><thead><tr><th>Client</th><th>Channel</th><th>Accounts</th><th>React/post</th><th>Views/post</th><th>Live</th><th>Status</th><th>Expiry</th></tr></thead><tbody>${d.rows.map(x=>`<tr><td>${esc(x.name)}</td><td>${esc(x.channel)}</td><td>${x.accounts}</td><td>${x.reactions}</td><td>${x.views}</td><td>${x.live}</td><td>${esc(x.status)}</td><td>${esc(x.expiry)}</td></tr>`).join('')}</tbody></table></div>`}
@@ -133,6 +134,9 @@ def api_summary():
     slots = sorted(set(int(d.get("slot", 0) or 0) for d in docs))
     owners = {d.get("owner") for d in docs if d.get("owner") and d.get("lease_until") and d["lease_until"] > now()}
     clients = db["clients"]
+    live_rows = list(db["live_state"].find({}))
+    voice_accounts = sum(len(row.get("keys", [])) for row in live_rows)
+    voice_memberships = sum(int(row.get("target", 0) or 0) for row in live_rows)
     tasks = []
     for parent in db["dashboard_tasks"].find({"kind": "parent"}).sort("created_at", -1).limit(12):
         children = list(db["dashboard_tasks"].find({"parent_id": parent["_id"]}))
@@ -140,7 +144,7 @@ def api_summary():
         ok = sum(int(c.get("result", {}).get("ok", 0) or 0) for c in children)
         fail = sum(int(c.get("result", {}).get("failed", 0) or 0) for c in children)
         tasks.append({"when": parent.get("created_at", now()).strftime("%d %b %H:%M"), "action": parent.get("action"), "progress": int(done / len(children) * 100) if children else 0, "ok": ok, "fail": fail, "status": "running" if done < len(children) else ("failed" if any(c.get("status") == "failed" for c in children) else "done")})
-    return jsonify({"total": total, "leased": leased, "flood": 0, "dead": 0, "banned": 0, "workers": len(slots), "live_workers": len(owners), "slots": slots, "clients": clients.count_documents({"status":"active"}), "voice": {"active": 0, "accounts": 0, "memberships": 0, "max_per_account": 1}, "tasks": tasks})
+    return jsonify({"total": total, "leased": leased, "flood": 0, "dead": 0, "banned": 0, "workers": len(slots), "live_workers": len(owners), "slots": slots, "clients": clients.count_documents({"status":"active"}), "voice": {"active": len(live_rows), "accounts": voice_accounts, "memberships": voice_memberships, "max_per_account": 1}, "tasks": tasks})
 
 
 @app.get("/api/sessions")
@@ -175,7 +179,7 @@ def api_actions():
     if (err := guard()): return err
     body=request.get_json(silent=True) or {}
     action=str(body.get("action","")).strip()
-    if action not in {"join","leave","react","views","set_name","live_start","live_stop","live_rotate"}:
+    if action not in {"join","leave","react","views","set_name","random_names","live_start","live_stop","live_rotate"}:
         return jsonify({"error":"unsupported action"}),400
     params=body.get("params") or {}
     parent_id=ObjectId()
@@ -188,5 +192,28 @@ def api_actions():
     return jsonify({"id":str(parent_id),"workers":len(slots)})
 
 
+@app.post("/api/profile-photo")
+def api_profile_photo():
+    if (err := guard()): return err
+    upload = request.files.get("photo")
+    if upload is None or not upload.filename:
+        return jsonify({"error":"photo is required"}),400
+    name = f"dashboard/uploads/{ObjectId()}.jpg"
+    data = upload.read()
+    fs = GridFS(db, collection=BUCKET)
+    file_id = fs.put(data, filename=name, metadata={"kind":"dashboard_upload", "size":len(data)})
+    db["storage_manifest"].replace_one(
+        {"_id": name},
+        {"_id": name, "gridfs_id": file_id, "kind":"dashboard_upload", "size":len(data), "updated_at":now()},
+        upsert=True,
+    )
+    parent_id=ObjectId()
+    slots=worker_slots()
+    db["dashboard_tasks"].insert_one({"_id":parent_id,"kind":"parent","action":"profile_photo","params":{"file_name":name},"status":"queued","created_at":now()})
+    db["dashboard_tasks"].insert_many([{"_id":ObjectId(),"kind":"child","parent_id":parent_id,"action":"profile_photo","params":{"file_name":name},"worker_slot":slot,"status":"queued","created_at":now()} for slot in slots])
+    return jsonify({"id":str(parent_id),"workers":len(slots)})
+
+
 if __name__ == "__main__":
+
     app.run(host="0.0.0.0", port=int(os.getenv("PORT","5000")))

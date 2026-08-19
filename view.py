@@ -619,6 +619,7 @@ col_storage = None
 col_account_shards = None
 col_dashboard_tasks = None
 col_dashboard_tokens = None
+col_live_state = None
 storage_lock = None
 
 
@@ -626,7 +627,8 @@ def initialize_mongo_client():
     """Create Motor/GridFS objects on the current event loop."""
     global mongo_client, mdb, col_history, col_approved, col_clients
     global col_stats, col_settings, storage_bucket, col_storage
-    global col_account_shards, col_dashboard_tasks, col_dashboard_tokens, storage_lock
+    global col_account_shards, col_dashboard_tasks, col_dashboard_tokens
+    global col_live_state, storage_lock
     if mongo_client is not None:
         return
     mongo_client = AsyncIOMotorClient(
@@ -650,6 +652,7 @@ def initialize_mongo_client():
     col_account_shards = mdb["account_shards"]
     col_dashboard_tasks = mdb["dashboard_tasks"]
     col_dashboard_tokens = mdb["dashboard_tokens"]
+    col_live_state = mdb["live_state"]
     storage_lock = asyncio.Lock()
     logger.info("MongoDB/GridFS client created")
 
@@ -1423,6 +1426,48 @@ async def _dashboard_set_name_local(params: dict) -> dict:
     return result
 
 
+async def _dashboard_random_names_local(params: dict) -> dict:
+    names = [x.strip() for x in str(params.get("names", "")).replace("\\n", ",").split(",") if x.strip()]
+    if not names:
+        return {"ok": 0, "failed": len(acc_keys()), "error": "names are empty"}
+    result = {"ok": 0, "failed": 0}
+    for key in list(acc_keys()):
+        try:
+            name = random.choice(names)
+            parts = name.split(None, 1)
+            await acc_client(key)(UpdateProfileRequest(
+                first_name=parts[0], last_name=parts[1] if len(parts) > 1 else ""))
+            ACCOUNTS[key].name = parts[0]
+            result["ok"] += 1
+        except Exception:
+            result["failed"] += 1
+    return result
+
+
+async def _dashboard_profile_photo_local(params: dict) -> dict:
+    remote_name = str(params.get("file_name", "")).strip()
+    if not remote_name:
+        return {"ok": 0, "failed": len(acc_keys()), "error": "photo upload missing"}
+    path = os.path.join(tempfile.gettempdir(), "dashboard-profile-" + secrets.token_hex(8) + ".jpg")
+    if not await storage_download_path(remote_name, path):
+        return {"ok": 0, "failed": len(acc_keys()), "error": "photo upload unavailable"}
+    result = {"ok": 0, "failed": 0}
+    try:
+        for key in list(acc_keys()):
+            try:
+                uploaded = await acc_client(key).upload_file(path)
+                await acc_client(key)(UploadProfilePhotoRequest(file=uploaded))
+                result["ok"] += 1
+            except Exception:
+                result["failed"] += 1
+    finally:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+    return result
+
+
 async def _dashboard_live_local(params: dict) -> dict:
     action = str(params.get("mode", "stop"))
     result = {"ok": 0, "failed": 0}
@@ -1482,6 +1527,10 @@ async def run_dashboard_child_task(task: dict) -> dict:
         return await _dashboard_views_local(params)
     if action == "set_name":
         return await _dashboard_set_name_local(params)
+    if action == "random_names":
+        return await _dashboard_random_names_local(params)
+    if action == "profile_photo":
+        return await _dashboard_profile_photo_local(params)
     if action in {"live_start", "live_stop", "live_rotate"}:
         params = dict(params)
         params["mode"] = action[len("live_"):]
@@ -3742,6 +3791,24 @@ async def stop_live_audio(key: str, chat_id: int):
             logger.debug(f"leave call {key}: {e}")
     LIVE_AUDIO.get(chat_id, set()).discard(key)
     LIVE_SESSIONS.get(chat_id, {}).get("since", {}).pop(key, None)
+    await persist_live_state(chat_id)
+
+
+async def persist_live_state(chat_id: int):
+    if col_live_state is None:
+        return
+    keys = list(LIVE_AUDIO.get(chat_id, set()))
+    if not keys:
+        await col_live_state.delete_one({"_id": str(chat_id)})
+        return
+    sess = LIVE_SESSIONS.get(chat_id, {})
+    await col_live_state.update_one(
+        {"_id": str(chat_id)},
+        {"$set": {"chat_id": chat_id, "keys": keys,
+                  "label": sess.get("label", ""), "target": sess.get("target", 0),
+                  "updated_at": utcnow()}},
+        upsert=True,
+    )
 
 
 def live_session(chat_id: int) -> dict:
@@ -3804,6 +3871,7 @@ async def join_live_with_audio(keys: List[str], chat_id: int,
         if i + LIVE_JOIN_BATCH < len(keys):
             await asyncio.sleep(random.uniform(0.8, 1.5))
 
+    await persist_live_state(chat_id)
     logger.info(f"live stream: {ok}/{len(keys)} accounts streaming audio"
                 + (f" for {label}" if label else ""))
     return ok, errors
@@ -3980,6 +4048,7 @@ async def live_keepalive_task():
                     LIVE_AUDIO.get(chat_id, set()).discard(key)
                     LIVE_SESSIONS.get(chat_id, {}).get("since", {}).pop(key, None)
                 end_live_session(chat_id)
+                await persist_live_state(chat_id)
                 logger.info(f"live stream ended in {chat_id} — accounts left")
                 continue
 

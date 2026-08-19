@@ -1234,6 +1234,27 @@ async def reconcile_account_shards() -> set:
     return claimed
 
 
+async def prune_local_sessions_not_owned():
+    if not sharding_runtime_enabled() or WORKER_SESSION_NAMES is None:
+        return
+    for filename in os.listdir(SESSIONS_DIR):
+        if not filename.endswith(".session"):
+            continue
+        remote = _storage_name("sessions", filename)
+        if remote in WORKER_SESSION_NAMES:
+            continue
+        stem = os.path.splitext(filename)[0]
+        for local in (os.path.join(SESSIONS_DIR, filename),
+                      os.path.join(SESSIONS_DIR, stem + ".json"),
+                      os.path.join(SESSIONS_DIR, stem + ".session-journal"),
+                      os.path.join(SESSIONS_DIR, stem + ".session-wal"),
+                      os.path.join(SESSIONS_DIR, stem + ".session-shm")):
+            try:
+                os.unlink(local)
+            except FileNotFoundError:
+                pass
+
+
 async def release_worker_shards():
     if not sharding_runtime_enabled() or col_account_shards is None:
         return
@@ -6789,8 +6810,8 @@ async def handle_zip_import(event):
             S("Copying into the MongoDB-backed session store..."),
         ]), force=True)
 
-        stats = {"alive": 0, "dead": 0, "unknown": 0, "no_meta": 0,
-                 "desktop": 0, "android": 0}
+        stats = {"alive": 0, "dead": 0, "unknown": 0, "queued": 0,
+                 "no_meta": 0, "desktop": 0, "android": 0}
         new_keys: List[str] = []
 
         # Reserve unique destination names before starting concurrent probes.
@@ -6846,6 +6867,14 @@ async def handle_zip_import(event):
                        user_id=meta_get(meta, "user_id") or 0,
                        first_name=meta_get(meta, "first_name") or "",
                        phone=meta_get(meta, "phone") or "", **device)
+
+            if sharding_runtime_enabled():
+                # Do not open every imported session on worker.1. Persist the
+                # file, let Mongo assign its shard, and let the owning worker
+                # probe it. This is what prevents a ZIP import from briefly
+                # using all accounts on the controller IP.
+                result["state"] = "queued"
+                return result
 
             try:
                 # Do not upload twice. probe_and_register persists a live
@@ -6904,6 +6933,11 @@ async def handle_zip_import(event):
                 stats["dead"] += 1
             await asyncio.sleep(0.3)
 
+        if sharding_runtime_enabled():
+            await reconcile_account_shards()
+            await restore_runtime_storage()
+            await prune_local_sessions_not_owned()
+
         await setup_channel_monitors()
         # Every account that came in from this ZIP now walks into all the
         # active client channels, in the background, so the fleet that just grew
@@ -6914,8 +6948,12 @@ async def handle_zip_import(event):
             field(E_GREEN, "Now online", str(stats["alive"])),
             field(E_RED, "Not authorised", str(stats["dead"])),
             field(E_WARN, "Unclear", str(stats["unknown"])),
+            (field(E_PAGE, "Queued for account workers", str(stats["queued"]))
+             if stats.get("queued") else None),
             "",
-            field(E_PERSON, "Total accounts online", str(acc_count())),
+            field(E_PERSON, "Accounts on this worker", str(acc_count())),
+            (field(E_CHART, "Total queued sessions", str(stats["queued"]))
+             if stats.get("queued") else None),
             "",
             field(E_DIAMOND, "Desktop profile", str(stats["desktop"])),
             field(E_PHONE, "Android profile", str(stats["android"])),

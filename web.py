@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from datetime import datetime, timezone
 from html import escape
 
@@ -51,14 +52,18 @@ const esc=x=>String(x??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&
 async function get(u,o){let r=await fetch(u,o);if(r.status===401){location.href='/';return null}return r.json()}
 function nav(page){document.querySelectorAll('[data-page]').forEach(a=>a.classList.toggle('active',a.dataset.page===page));clearInterval(timer);({dashboard:dashboard,actions:actions,sessions:sessions,accounts:accounts,plans:plans,activity:activity}[page]||dashboard)()}
 document.querySelectorAll('[data-page]').forEach(a=>a.onclick=e=>{e.preventDefault();nav(a.dataset.page)});
-async function dashboard(){let d=await get('/api/summary');if(!d)return;app.innerHTML=`<h1>Dashboard</h1><div class="cards"><div class="card"><div class="num">${d.total}</div><div class="label">Total accounts</div></div><div class="card"><div class="num green">${d.leased}</div><div class="label">Accounts online</div></div><div class="card"><div class="num yellow">${d.flood}</div><div class="label">Flood</div></div><div class="card"><div class="num red">${d.dead}</div><div class="label">Dead</div></div><div class="card"><div class="num red">${d.banned}</div><div class="label">Banned</div></div></div><div class="panel" style="margin-top:14px"><div class="workers"><strong>Workers: ${d.live_workers}/${d.workers} online</strong> &nbsp; ${d.slots.join(', ')||'none'}</div></div><h2>Voice chats</h2><div class="cards" style="grid-template-columns:repeat(4,1fr)"><div class="card"><div class="num">${d.voice.active}</div><div class="label">Active VCs</div></div><div class="card"><div class="num green">${d.voice.accounts}</div><div class="label">Accounts in use</div></div><div class="card"><div class="num">${d.voice.memberships}</div><div class="label">VC memberships</div></div><div class="card"><div class="num yellow">${d.voice.max_per_account}</div><div class="label">Max calls/account</div></div></div><h2>Recent tasks</h2><div class="panel"><table><thead><tr><th>When</th><th>Action</th><th>Progress</th><th>OK</th><th>Fail</th><th>Status</th></tr></thead><tbody>${d.tasks.map(t=>`<tr><td>${esc(t.when)}</td><td>${esc(t.action)}</td><td>${t.progress}%</td><td class="green">${t.ok}</td><td class="red">${t.fail}</td><td><span class="pill ${t.status==='done'?'ok':t.status==='failed'?'bad':''}">${esc(t.status)}</span></td></tr>`).join('')}</tbody></table></div>`;timer=setInterval(dashboard,10000)}
+async function dashboard(){let d=await get('/api/summary');if(!d)return;app.innerHTML=`<h1>Dashboard</h1><div class="cards"><div class="card"><div class="num">${d.total}</div><div class="label">Total accounts</div></div><div class="card"><div class="num green">${d.leased}</div><div class="label">Accounts online</div></div><div class="card"><div class="num yellow">${d.flood}</div><div class="label">Flood</div></div><div class="card"><div class="num red">${d.dead}</div><div class="label">Dead</div></div><div class="card"><div class="num red">${d.banned}</div><div class="label">Banned</div></div></div><div class="panel" style="margin-top:14px"><div class="workers"><strong>Workers: ${d.live_workers}/${d.workers} online</strong> &nbsp; ${d.slots.join(', ')||'none'}</div></div><h2>Voice chats</h2><div class="cards" style="grid-template-columns:repeat(4,1fr)"><div class="card"><div class="num">${d.voice.active}</div><div class="label">Active VCs</div></div><div class="card"><div class="num green">${d.voice.accounts}</div><div class="label">Accounts in use</div></div><div class="card"><div class="num">${d.voice.memberships}</div><div class="label">VC memberships</div></div><div class="card"><div class="num yellow">${d.voice.max_per_account}</div><div class="label">Max calls/account</div></div></div><h2>Recent tasks</h2><div class="panel"><table><thead><tr><th>When</th><th>Action</th><th>Target</th><th>Progress</th><th>OK</th><th>Fail</th><th>Status</th></tr></thead><tbody>${d.tasks.map(t=>`<tr><td>${esc(t.when)}</td><td>${esc(t.action)}</td><td>${esc(t.target||'')}</td><td>${t.progress}%</td><td class="green">${t.ok}</td><td class="red">${t.fail}</td><td><span class="pill ${t.status==='done'?'ok':t.status==='failed'?'bad':''}">${esc(t.status)}</span></td></tr>`).join('')}</tbody></table></div>`;timer=setInterval(dashboard,10000)}
 function actionForm(title,action,fields){return `<div class="form"><h3>${title}</h3>${fields.map(f=>`<input id="${action}-${f[0]}" placeholder="${f[1]}" ${f[2]||''}>`).join('')}<button class="btn" onclick="runAction('${action}')">${title}</button></div>`}
 async function runAction(action){let p={};document.querySelectorAll(`[id^="${action}-"]`).forEach(x=>{p[x.id.slice(action.length+1)]=x.value});let d=await get('/api/actions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action,params:p})});document.getElementById('result').innerHTML=d?`Queued task <b>${esc(d.id)}</b>`:''}
 async function uploadPhoto(){let f=document.getElementById('photo-file').files[0];if(!f){document.getElementById('result').innerText='Choose a photo first';return}let fd=new FormData();fd.append('photo',f);let d=await get('/api/profile-photo',{method:'POST',body:fd});document.getElementById('result').innerText=d?`Queued task ${d.id}`:''}
-async function actions(){app.innerHTML=`<h1>Actions</h1><div class="grid">${actionForm('Join','join',[['target','https://t.me/group']])}${actionForm('Leave','leave',[['target','chat id or link']])}${actionForm('Set name','set_name',[['name','John Doe']])}${actionForm('Random names','random_names',[['names','Name One, Name Two, Name Three']])}${actionForm('React','react',[['target','post link'],['emoji','emoji (optional)']])}${actionForm('Views','views',[['target','post link']])}${actionForm('Live start','live_start',[['target','channel link']])}<div class="form"><h3>Profile photo</h3><input id="photo-file" type="file" accept="image/*"><button class="btn" onclick="uploadPhoto()">Set DP</button></div><div class="form"><h3>Live controls</h3><button class="btn danger" onclick="runAction('live_stop')">Stop all live calls</button><br><br><button class="btn secondary" onclick="runAction('live_rotate')">Rotate live accounts</button></div></div><div id="result" class="result">Choose an action.</div>`}
-async function sessions(){let d=await get('/api/sessions');app.innerHTML=`<h1>Sessions</h1><div class="panel"><table><thead><tr><th>Account</th><th>Worker</th><th>Status</th><th>Last update</th></tr></thead><tbody>${d.rows.map(x=>`<tr><td>${esc(x.account)}</td><td>worker.${x.slot+1}</td><td><span class="pill ${x.online?'ok':''}">${x.online?'online':'offline'}</span></td><td>${esc(x.updated)}</td></tr>`).join('')}</tbody></table></div>`}
+async function actions(){app.innerHTML=`<h1>Actions</h1><div class="grid">${actionForm('Join','join',[['target','https://t.me/group']])}${actionForm('Leave','leave',[['target','chat id or link']])}${actionForm('Set name','set_name',[['name','John Doe']])}${actionForm('Random names','random_names',[['names','Blank = built-in 500 Indian names']])}${actionForm('React','react',[['target','post link'],['emoji','emoji (optional)']])}${actionForm('Views','views',[['target','post link']])}${actionForm('Live start','live_start',[['target','channel link']])}<div class="form"><h3>Profile photo</h3><input id="photo-file" type="file" accept="image/*"><button class="btn" onclick="uploadPhoto()">Set DP</button></div><div class="form"><h3>Live controls</h3><button class="btn danger" onclick="runAction('live_stop')">Stop all live calls</button><br><br><button class="btn secondary" onclick="runAction('live_rotate')">Rotate live accounts</button></div></div><div id="result" class="result">Choose an action.</div>`}
+async function uploadZip(){let f=document.getElementById('zip-file').files[0];if(!f){document.getElementById('zip-result').innerText='Choose ZIP first';return}let fd=new FormData();fd.append('zip',f);let d=await get('/api/session-import',{method:'POST',body:fd});document.getElementById('zip-result').innerText=d?.error||`Queued import task ${d?.id||''}`}
+async function sessions(){let d=await get('/api/sessions');app.innerHTML=`<h1>Sessions</h1><div class="form" style="margin-bottom:16px"><h3>Import account ZIP</h3><input id="zip-file" type="file" accept=".zip"><button class="btn" onclick="uploadZip()">Import ZIP</button><span id="zip-result" style="margin-left:12px;color:#92a1b6"></span></div><div class="panel"><table><thead><tr><th>Account</th><th>Worker</th><th>Status</th><th>Last update</th></tr></thead><tbody>${d.rows.map(x=>`<tr><td>${esc(x.account)}</td><td>worker.${x.slot+1}</td><td><span class="pill ${x.online?'ok':''}">${x.online?'online':'offline'}</span></td><td>${esc(x.updated)}</td></tr>`).join('')}</tbody></table></div>`}
 async function accounts(){return sessions()}
-async function plans(){let d=await get('/api/plans');app.innerHTML=`<h1>Plans</h1><div class="panel"><table><thead><tr><th>Client</th><th>Channel</th><th>Accounts</th><th>React/post</th><th>Views/post</th><th>Live</th><th>Status</th><th>Expiry</th></tr></thead><tbody>${d.rows.map(x=>`<tr><td>${esc(x.name)}</td><td>${esc(x.channel)}</td><td>${x.accounts}</td><td>${x.reactions}</td><td>${x.views}</td><td>${x.live}</td><td>${esc(x.status)}</td><td>${esc(x.expiry)}</td></tr>`).join('')}</tbody></table></div>`}
+async function createClient(){let p={client_user_id:Number(document.getElementById('client-user').value),client_name:document.getElementById('client-name').value,channel_link:document.getElementById('client-channel').value,accounts_count:Number(document.getElementById('client-accounts').value||1),reactions_per_post:Number(document.getElementById('client-react').value||0),views_per_post:Number(document.getElementById('client-views').value||0),livestream_accounts:Number(document.getElementById('client-live').value||0),subscription_days:Number(document.getElementById('client-days').value||30)};let d=await get('/api/clients',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});document.getElementById('client-result').innerText=d?.error||`Client created; task ${d?.task_id||''}`;if(d&&!d.error)setTimeout(plans,1000)}
+async function clientPatch(id,data){await get('/api/clients/'+id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});plans()}
+async function deleteClient(id){if(confirm('Delete this client subscription?')){await get('/api/clients/'+id,{method:'DELETE'});plans()}}
+async function plans(){let d=await get('/api/plans');app.innerHTML=`<h1>Plans</h1><div class="form" style="margin-bottom:16px"><h3>Create client</h3><div class="grid"><input id="client-user" placeholder="Client Telegram user ID"><input id="client-name" placeholder="Client name"><input id="client-channel" placeholder="Channel link"><input id="client-accounts" type="number" placeholder="Accounts (1-10 per worker)"><input id="client-react" type="number" placeholder="Reactions/post"><input id="client-views" type="number" placeholder="Views/post"><input id="client-live" type="number" placeholder="Live accounts"><input id="client-days" type="number" placeholder="Days"></div><button class="btn" onclick="createClient()">Create Client</button><span id="client-result" style="margin-left:12px;color:#92a1b6"></span></div><div class="panel"><table><thead><tr><th>Client</th><th>Channel</th><th>Accounts</th><th>React/post</th><th>Views/post</th><th>Live</th><th>Status</th><th>Expiry</th><th>Manage</th></tr></thead><tbody>${d.rows.map(x=>`<tr><td>${esc(x.name)}</td><td>${esc(x.channel)}</td><td>${x.accounts}</td><td>${x.reactions}</td><td>${x.views}</td><td>${x.live}</td><td>${esc(x.status)}</td><td>${esc(x.expiry)}</td><td><button class="btn secondary" onclick="clientPatch('${x.id}',{status:'${x.status==='active'?'stopped':'active'}'})">${x.status==='active'?'Pause':'Resume'}</button> <button class="btn" onclick="clientPatch('${x.id}',{extend_days:30})">+30d</button> <button class="btn danger" onclick="deleteClient('${x.id}')">Delete</button></td></tr>`).join('')}</tbody></table></div>`}
 async function activity(){let d=await get('/api/activity');app.innerHTML=`<h1>Activity</h1><div class="panel"><table><thead><tr><th>Time</th><th>Account</th><th>Action</th><th>Target</th><th>Status</th></tr></thead><tbody>${d.rows.map(x=>`<tr><td>${esc(x.time)}</td><td>${esc(x.account)}</td><td>${esc(x.action)}</td><td>${esc(x.target)}</td><td>${esc(x.status)}</td></tr>`).join('')}</tbody></table></div>`}
 nav('dashboard');
 </script></body></html>
@@ -143,7 +148,7 @@ def api_summary():
         done = sum(1 for c in children if c.get("status") in {"done", "failed", "partial"})
         ok = sum(int(c.get("result", {}).get("ok", 0) or 0) for c in children)
         fail = sum(int(c.get("result", {}).get("failed", 0) or 0) for c in children)
-        tasks.append({"when": parent.get("created_at", now()).strftime("%d %b %H:%M"), "action": parent.get("action"), "progress": int(done / len(children) * 100) if children else 0, "ok": ok, "fail": fail, "status": "running" if done < len(children) else ("failed" if any(c.get("status") == "failed" for c in children) else "done")})
+        tasks.append({"when": parent.get("created_at", now()).strftime("%d %b %H:%M"), "action": parent.get("action"), "target": (parent.get("params") or {}).get("target", ""), "progress": int(done / len(children) * 100) if children else 0, "ok": ok, "fail": fail, "status": "running" if done < len(children) else ("failed" if any(c.get("status") == "failed" for c in children) else "done")})
     return jsonify({"total": total, "leased": leased, "flood": 0, "dead": 0, "banned": 0, "workers": len(slots), "live_workers": len(owners), "slots": slots, "clients": clients.count_documents({"status":"active"}), "voice": {"active": len(live_rows), "accounts": voice_accounts, "memberships": voice_memberships, "max_per_account": 1}, "tasks": tasks})
 
 
@@ -161,7 +166,7 @@ def api_plans():
     if (err := guard()): return err
     rows=[]
     for d in db["clients"].find({}).sort("created_at", -1):
-        rows.append({"name": d.get("client_name","Unknown"), "channel": d.get("channel_link",""), "accounts": d.get("accounts_count",0), "reactions": d.get("reactions_per_post",0), "views": d.get("views_per_post",0), "live": d.get("livestream_accounts",0), "status": d.get("status",""), "expiry": d.get("expires_at", now()).strftime("%d %b %Y %H:%M") if hasattr(d.get("expires_at"),"strftime") else "-"})
+        rows.append({"id": str(d.get("_id")), "name": d.get("client_name","Unknown"), "channel": d.get("channel_link",""), "accounts": d.get("accounts_count",0), "reactions": d.get("reactions_per_post",0), "views": d.get("views_per_post",0), "live": d.get("livestream_accounts",0), "status": d.get("status",""), "expiry": d.get("expires_at", now()).strftime("%d %b %Y %H:%M") if hasattr(d.get("expires_at"),"strftime") else "-"})
     return jsonify({"rows": rows})
 
 
@@ -174,6 +179,23 @@ def api_activity():
     return jsonify({"rows": rows})
 
 
+def queue_fanout(action, params):
+    parent_id = ObjectId()
+    slots = worker_slots()
+    db["dashboard_tasks"].insert_one({
+        "_id": parent_id, "kind": "parent", "action": action,
+        "params": params, "status": "queued", "created_at": now(),
+    })
+    children = [{
+        "_id": ObjectId(), "kind": "child", "parent_id": parent_id,
+        "action": action, "params": params, "worker_slot": slot,
+        "status": "queued", "created_at": now(),
+    } for slot in slots]
+    if children:
+        db["dashboard_tasks"].insert_many(children)
+    return parent_id, len(slots)
+
+
 @app.post("/api/actions")
 def api_actions():
     if (err := guard()): return err
@@ -182,14 +204,106 @@ def api_actions():
     if action not in {"join","leave","react","views","set_name","random_names","live_start","live_stop","live_rotate"}:
         return jsonify({"error":"unsupported action"}),400
     params=body.get("params") or {}
-    parent_id=ObjectId()
-    slots=worker_slots()
-    db["dashboard_tasks"].insert_one({"_id":parent_id,"kind":"parent","action":action,"params":params,"status":"queued","created_at":now()})
-    children=[]
-    for slot in slots:
-        children.append({"_id":ObjectId(),"kind":"child","parent_id":parent_id,"action":action,"params":params,"worker_slot":slot,"status":"queued","created_at":now()})
-    if children: db["dashboard_tasks"].insert_many(children)
-    return jsonify({"id":str(parent_id),"workers":len(slots)})
+    parent_id, slots = queue_fanout(action, params)
+    return jsonify({"id":str(parent_id),"workers":slots})
+
+
+@app.post("/api/clients")
+def api_create_client():
+    if (err := guard()): return err
+    body = request.get_json(silent=True) or {}
+    try:
+        user_id = int(body.get("client_user_id"))
+        accounts = max(1, int(body.get("accounts_count", 1)))
+        reactions = max(0, int(body.get("reactions_per_post", 0)))
+        views = max(0, int(body.get("views_per_post", 0)))
+        live = max(0, int(body.get("livestream_accounts", 0)))
+        days = max(1, int(body.get("subscription_days", 30)))
+    except (TypeError, ValueError):
+        return jsonify({"error":"numeric package fields are invalid"}), 400
+    link = str(body.get("channel_link", "")).strip()
+    if not link or reactions == 0 and views == 0:
+        return jsonify({"error":"channel_link and reactions/views are required"}), 400
+    private = bool(re.search(r"t\.me/(?:\+|joinchat/)", link))
+    target_match = re.search(r"t\.me/(?:\+|joinchat/)([A-Za-z0-9_-]+)", link)
+    public_match = re.search(r"(?:t\.me/|@)([A-Za-z0-9_]{4,32})", link)
+    target = (target_match.group(1) if private else public_match.group(1)
+              if public_match else None)
+    if not target:
+        return jsonify({"error":"invalid channel link"}), 400
+    doc = {
+        "client_user_id": user_id, "client_name": str(body.get("client_name") or "Unknown"),
+        "channel_link": link, "channel_id": None,
+        "channel_username": None if private else target,
+        "channel_type": "private" if private else "public",
+        "accounts_count": accounts, "reactions_per_post": reactions,
+        "views_per_post": views, "livestream_accounts": live,
+        "subscription_days": days, "created_at": now(),
+        "expires_at": now() + __import__("datetime").timedelta(days=days),
+        "status": "active", "joined_accounts": [],
+        "last_reminder_sent": None, "total_posts_processed": 0,
+        "updated_at": now(),
+    }
+    inserted = db["clients"].insert_one(doc)
+    parent_id, slots = queue_fanout("join", {"target": link, "client_id": str(inserted.inserted_id)})
+    return jsonify({"id": str(inserted.inserted_id), "task_id": str(parent_id), "workers": slots})
+
+
+@app.patch("/api/clients/<client_id>")
+def api_update_client(client_id):
+    if (err := guard()): return err
+    body = request.get_json(silent=True) or {}
+    try:
+        oid = ObjectId(client_id)
+    except Exception:
+        return jsonify({"error":"invalid client id"}), 400
+    update = {k: body[k] for k in ("status", "reactions_per_post", "views_per_post", "livestream_accounts") if k in body}
+    if "extend_days" in body:
+        try:
+            update["expires_at"] = now() + __import__("datetime").timedelta(days=int(body["extend_days"]))
+        except (TypeError, ValueError):
+            return jsonify({"error":"extend_days is invalid"}), 400
+    update["updated_at"] = now()
+    result = db["clients"].update_one({"_id": oid}, {"$set": update})
+    return jsonify({"updated": result.modified_count})
+
+
+@app.delete("/api/clients/<client_id>")
+def api_delete_client(client_id):
+    if (err := guard()): return err
+    try:
+        oid = ObjectId(client_id)
+    except Exception:
+        return jsonify({"error":"invalid client id"}), 400
+    doc = db["clients"].find_one({"_id": oid})
+    if not doc:
+        return jsonify({"error":"client not found"}), 404
+    parent_id, slots = queue_fanout("leave", {"target": doc.get("channel_link", "")})
+    db["clients"].delete_one({"_id": oid})
+    return jsonify({"deleted": True, "task_id": str(parent_id), "workers": slots})
+
+
+@app.post("/api/session-import")
+def api_session_import():
+    if (err := guard()): return err
+    upload = request.files.get("zip")
+    if upload is None or not upload.filename:
+        return jsonify({"error":"ZIP file is required"}), 400
+    name = f"dashboard/uploads/{ObjectId()}.zip"
+    data = upload.read()
+    fs = GridFS(db, collection=BUCKET)
+    file_id = fs.put(data, filename=name, metadata={"kind":"dashboard_upload", "size":len(data)})
+    db["storage_manifest"].replace_one(
+        {"_id": name},
+        {"_id": name, "gridfs_id": file_id, "kind":"dashboard_upload", "size":len(data), "updated_at":now()},
+        upsert=True,
+    )
+    parent_id = ObjectId()
+    db["dashboard_tasks"].insert_one({"_id":parent_id,"kind":"parent","action":"session_import","params":{"file_name":name},"status":"queued","created_at":now()})
+    # Only the controller consumes the ZIP; it persists files and the shard
+    # workers claim/probe their own ten-session slice.
+    db["dashboard_tasks"].insert_one({"_id":ObjectId(),"kind":"child","parent_id":parent_id,"action":"session_import","params":{"file_name":name},"worker_slot":0,"status":"queued","created_at":now()})
+    return jsonify({"id":str(parent_id),"workers":1})
 
 
 @app.post("/api/profile-photo")

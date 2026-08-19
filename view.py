@@ -70,6 +70,7 @@ from telethon.tl.types import (
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorGridFSBucket
 from bson.objectid import ObjectId
 from pymongo import InsertOne, ReturnDocument, UpdateOne
+from random_names import INDIAN_RANDOM_NAMES
 
 # Optional so the bot still boots on a host without ffmpeg/ntgcalls; every
 # live-audio path checks TGCALLS_OK first and reports the missing dependency
@@ -1429,6 +1430,8 @@ async def _dashboard_set_name_local(params: dict) -> dict:
 async def _dashboard_random_names_local(params: dict) -> dict:
     names = [x.strip() for x in str(params.get("names", "")).replace("\\n", ",").split(",") if x.strip()]
     if not names:
+        names = list(INDIAN_RANDOM_NAMES)
+    if not names:
         return {"ok": 0, "failed": len(acc_keys()), "error": "names are empty"}
     result = {"ok": 0, "failed": 0}
     for key in list(acc_keys()):
@@ -1468,7 +1471,81 @@ async def _dashboard_profile_photo_local(params: dict) -> dict:
     return result
 
 
-async def _dashboard_live_local(params: dict) -> dict:
+async def _dashboard_session_import_local(params: dict) -> dict:
+    """Import a dashboard ZIP through the controller worker without opening all
+    sessions there. Files are persisted first; shard workers probe their own
+    ten-account slice on the next reconciliation.
+    """
+    remote_name = str(params.get("file_name", "")).strip()
+    if not remote_name:
+        return {"ok": 0, "failed": 1, "error": "ZIP upload missing"}
+    raw = await storage_get_bytes(remote_name)
+    if not raw:
+        return {"ok": 0, "failed": 1, "error": "ZIP upload unavailable"}
+    temp_dir = tempfile.mkdtemp(prefix="dashboard-import-")
+    try:
+        zip_path = os.path.join(temp_dir, "import.zip")
+        with open(zip_path, "wb") as fh:
+            fh.write(raw)
+        extract_dir = os.path.join(temp_dir, "x")
+        os.makedirs(extract_dir, exist_ok=True)
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            archive.extractall(extract_dir)
+        found = []
+        for root, _dirs, files in os.walk(extract_dir):
+            for filename in files:
+                if filename.endswith(".session"):
+                    found.append(os.path.join(root, filename))
+        reserved = set(os.listdir(SESSIONS_DIR))
+        ok = failed = 0
+        for source in found:
+            stem = os.path.splitext(os.path.basename(source))[0]
+            filename = stem + ".session"
+            n = 1
+            while filename in reserved:
+                filename = f"{stem}_{n}.session"
+                n += 1
+            reserved.add(filename)
+            destination = os.path.join(SESSIONS_DIR, filename)
+            try:
+                shutil.copy2(source, destination)
+                source_stem = os.path.splitext(source)[0]
+                meta = {}
+                for candidate in (source_stem + ".json",
+                                  os.path.join(os.path.dirname(source), stem + ".json")):
+                    if os.path.exists(candidate):
+                        try:
+                            with open(candidate, "r", encoding="utf-8") as fh:
+                                loaded = json.load(fh)
+                            if isinstance(loaded, dict):
+                                meta = loaded
+                                break
+                        except Exception:
+                            pass
+                api_id, api_hash = creds_from_meta(meta)
+                device = device_profile_for(api_id, meta)
+                write_meta(destination, api_id=api_id, api_hash=api_hash,
+                           user_id=meta_get(meta, "user_id") or 0,
+                           first_name=meta_get(meta, "first_name") or "",
+                           phone=meta_get(meta, "phone") or "", **device)
+                await persist_session_bundle(destination)
+                ok += 1
+            except Exception as exc:
+                failed += 1
+                logger.warning("dashboard ZIP session %s: %s", source, exc)
+        if sharding_runtime_enabled():
+            await reconcile_account_shards()
+            await restore_runtime_storage()
+            await prune_local_sessions_not_owned()
+        return {"ok": ok, "failed": failed, "queued": ok,
+                "error": "" if not failed else "some files failed"}
+    except zipfile.BadZipFile:
+        return {"ok": 0, "failed": 1, "error": "invalid ZIP"}
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+async def _dashboard_live_local(params: dict):
     action = str(params.get("mode", "stop"))
     result = {"ok": 0, "failed": 0}
     if action == "stop":
@@ -1531,6 +1608,8 @@ async def run_dashboard_child_task(task: dict) -> dict:
         return await _dashboard_random_names_local(params)
     if action == "profile_photo":
         return await _dashboard_profile_photo_local(params)
+    if action == "session_import":
+        return await _dashboard_session_import_local(params)
     if action in {"live_start", "live_stop", "live_rotate"}:
         params = dict(params)
         params["mode"] = action[len("live_"):]

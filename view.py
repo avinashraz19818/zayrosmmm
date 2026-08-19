@@ -1314,6 +1314,26 @@ async def worker_shard_reconcile_task():
             logger.error("worker shard reconcile: %s", exc)
 
 
+async def enqueue_internal_worker_fanout(action: str, params: Optional[dict] = None):
+    if col_dashboard_tasks is None:
+        return None
+    slots = [0]
+    if col_account_shards is not None:
+        docs = await col_account_shards.find({}, {"slot": 1}).to_list(length=None)
+        slots = sorted(set(int(d.get("slot", 0) or 0) for d in docs)) or [0]
+    parent_id = ObjectId()
+    await col_dashboard_tasks.insert_one({
+        "_id": parent_id, "kind": "parent", "action": action,
+        "params": params or {}, "status": "queued", "created_at": utcnow(),
+    })
+    await col_dashboard_tasks.insert_many([{
+        "_id": ObjectId(), "kind": "child", "parent_id": parent_id,
+        "action": action, "params": params or {}, "worker_slot": slot,
+        "status": "queued", "created_at": utcnow(),
+    } for slot in slots])
+    return parent_id
+
+
 async def _dashboard_join_local(params: dict) -> dict:
     link = str(params.get("target", "")).strip()
     ltype, target = parse_target(link)
@@ -1558,6 +1578,51 @@ async def _dashboard_session_import_local(params: dict) -> dict:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+async def _dashboard_manual_live_local(params: dict) -> dict:
+    target_link = str(params.get("target", "")).strip()
+    requested = max(1, int(params.get("count", 1) or 1))
+    ltype, parsed = parse_target(target_link)
+    if ltype not in ("public", "private"):
+        return {"ok": 0, "failed": 1, "error": "invalid channel link"}
+    ordered = []
+    if col_account_shards is not None:
+        docs = await col_account_shards.find({}, {"account_key": 1, "slot": 1}).sort("slot", 1).to_list(length=None)
+        ordered = [str(d.get("account_key")) for d in docs if d.get("account_key")]
+    local_keys = [key for key in ordered[:requested]
+                  if local_worker_account(key) and acc_client(key)]
+    if not local_keys:
+        return {"ok": 0, "failed": 0, "error": "no selected accounts on this worker"}
+    chat_id = None
+    for key in local_keys:
+        client = acc_client(key)
+        try:
+            if ltype == "public":
+                try:
+                    await client(JoinChannelRequest(parsed))
+                except UserAlreadyParticipantError:
+                    pass
+                entity = await client.get_entity(parsed)
+            else:
+                try:
+                    result = await client(ImportChatInviteRequest(parsed))
+                    chats = chats_from_join_result(result)
+                    entity = chats[0] if chats else await client.get_entity(target_link)
+                except UserAlreadyParticipantError:
+                    entity = await client.get_entity(target_link)
+            chat_id = utils.get_peer_id(entity)
+            break
+        except Exception:
+            continue
+    if chat_id is None:
+        return {"ok": 0, "failed": len(local_keys), "error": "channel not reachable"}
+    call = await get_active_call(chat_id, local_keys)
+    if call is None:
+        return {"ok": 0, "failed": len(local_keys), "error": "no active live stream"}
+    register_live_session(chat_id, local_keys, len(local_keys), target_link)
+    ok, errors = await join_live_with_audio(local_keys, chat_id, target_link)
+    return {"ok": ok, "failed": len(errors), "selected": len(local_keys)}
+
+
 async def _dashboard_live_local(params: dict):
     action = str(params.get("mode", "stop"))
     result = {"ok": 0, "failed": 0}
@@ -1604,9 +1669,17 @@ async def _dashboard_live_local(params: dict):
     return {"ok": 0, "failed": 1, "error": "unknown live action"}
 
 
+async def _dashboard_onboard_local(params: dict) -> dict:
+    stats = await onboard_new_accounts(list(acc_keys()))
+    return {"ok": stats.get("joins", 0) + stats.get("already", 0),
+            "failed": stats.get("failed", 0), "channels": stats.get("channels", 0)}
+
+
 async def run_dashboard_child_task(task: dict) -> dict:
     action = task.get("action")
     params = task.get("params") or {}
+    if action == "onboard":
+        return await _dashboard_onboard_local(params)
     if action == "join":
         return await _dashboard_join_local(params)
     if action == "leave":
@@ -1623,6 +1696,8 @@ async def run_dashboard_child_task(task: dict) -> dict:
         return await _dashboard_profile_photo_local(params)
     if action == "session_import":
         return await _dashboard_session_import_local(params)
+    if action == "manual_live":
+        return await _dashboard_manual_live_local(params)
     if action in {"live_start", "live_stop", "live_rotate"}:
         params = dict(params)
         params["mode"] = action[len("live_"):]
@@ -4439,6 +4514,11 @@ async def global_account_totals() -> Optional[Tuple[int, int, int, int]]:
     return total, leased_accounts, workers, len(owners)
 
 
+async def available_account_count() -> int:
+    totals = await global_account_totals()
+    return totals[0] if totals is not None else joinable_count()
+
+
 # ═══════════════════════ SCREENS ═══════════════════════
 async def safe_callback_answer(event, text="", alert=False):
     """Answer a callback if it is still fresh; expired taps are harmless."""
@@ -6678,22 +6758,34 @@ async def flow_go_live(event, state, text):
             return await bad(event, "That is not a valid channel link.", "home")
         state.update({"link": text.strip(), "ltype": ltype, "target": target,
                       "step": "count"})
+        available = await available_account_count()
         return await event.respond(card(E_PERSON, "Go Live", [
             field(E_CHANNEL, "Channel", esc(text.strip())),
-            field(E_GREEN, "Accounts online", str(acc_count())),
-            field(E_CHECK, "Free for live", str(len(free_live_keys(acc_keys())))),
+            field(E_GREEN, "Accounts across workers", str(available)),
+            field(E_CHECK, "Accounts per worker", str(ACCOUNT_SHARD_SIZE)),
             field(E_SHIELD, "Stream limit", cap_text()),
             field(E_REFRESH, "Rotation", rotate_text()),
             "",
             f"{S('How many accounts should join the live stream?')} "
-            f"(1-{live_limit(joinable_count())})",
+            f"(1-{live_limit(available)})",
         ]), buttons=[[btn("Cancel", "home", icon="↩️")]])
 
     if state["step"] == "count":
         if not text.isdigit() or int(text) < 1:
             return await bad(event, "Send a whole number.", "home")
-        n = live_limit(min(int(text), joinable_count()))
+        available = await available_account_count()
+        n = live_limit(min(int(text), available))
         task_states.pop(event.chat_id, None)
+        if sharding_runtime_enabled():
+            task_id = await enqueue_internal_worker_fanout(
+                "manual_live", {"target": state["link"], "count": n})
+            return await event.respond(card(E_CHECK, "Live Queued", [
+                field(E_PERSON, "Accounts requested", str(n)),
+                field(E_REFRESH, "Task", str(task_id)),
+                "",
+                S("Each worker will use only its own ten-account shard."),
+            ]), buttons=[[btn("Live Now", "live_now", icon="🎤"),
+                         btn("Home", "home", icon="🏠")]])
         return await execute_go_live(event, state, n)
 
 
@@ -7033,22 +7125,25 @@ async def flow_create_client(event, state, text):
                              f"cuser_{state['client_user_id']}")
         state.update({"channel_link": text.strip(), "channel_type": ltype,
                       "channel_target": target, "step": "accounts_count"})
+        available = await available_account_count()
         return await event.respond(card(E_PERSON, "Create Client", [
             S("Step 3 of 6"),
             "",
-            field(E_GREEN, "Accounts online", str(acc_count())),
+            field(E_GREEN, "Accounts available across workers", str(available)),
+            field(E_REFRESH, "Worker size", f"{ACCOUNT_SHARD_SIZE} {S('per worker')}"),
             "",
-            f"{S('How many accounts should join?')} (1-{joinable_count()})",
+            f"{S('How many accounts should join?')} (1-{available})",
         ]), buttons=[[btn("Cancel", "home", icon="↩️")]])
 
     if step == "accounts_count":
         if not text.isdigit():
             return await bad(event, "Numbers only.")
         n = int(text)
-        # Frozen accounts cannot join, so promising them to a client would
-        # under-deliver the package from day one.
-        if n < 1 or n > joinable_count():
-            return await bad(event, f"Enter between 1 and {joinable_count()}.")
+        # In sharded mode the controller only has its local ten sessions; the
+        # package limit must use the MongoDB fleet total instead.
+        available = await available_account_count()
+        if n < 1 or n > available:
+            return await bad(event, f"Enter between 1 and {available}.")
         state["accounts_count"] = n
         state["step"] = "reactions"
         return await event.respond(card(E_THUMB, "Create Client", [
@@ -7222,6 +7317,8 @@ async def create_client_now(event, state):
         "joined_accounts": joined,
     })
     await setup_channel_monitors()
+    if sharding_runtime_enabled():
+        await enqueue_internal_worker_fanout("onboard", {"subscription_id": str(sub["_id"])})
 
     warn = []
     if channel_id is None:

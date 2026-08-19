@@ -1574,6 +1574,10 @@ async def _dashboard_session_import_local(params: dict) -> dict:
             await reconcile_account_shards()
             await restore_runtime_storage()
             await prune_local_sessions_not_owned()
+            # Worker.1 is the controller and may own the first shard. Load its
+            # newly assigned files immediately instead of waiting for the next
+            # 60-second reconcile tick.
+            await load_all_sessions()
         return {"ok": ok, "failed": failed, "queued": ok,
                 "error": "" if not failed else "some files failed"}
     except zipfile.BadZipFile:
@@ -7578,6 +7582,7 @@ async def handle_zip_import(event):
             await reconcile_account_shards()
             await restore_runtime_storage()
             await prune_local_sessions_not_owned()
+            await load_all_sessions()
 
         await setup_channel_monitors()
         # Every account that came in from this ZIP now walks into all the

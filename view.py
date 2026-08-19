@@ -1130,7 +1130,7 @@ async def reconcile_account_shards() -> set:
         return set()
 
     session_docs = await col_storage.find(
-        {"_id": {"$regex": r"^sessions/.*\\.session$"}},
+        {"_id": {"$regex": r"^sessions/.*\.session$"}},
         {"_id": 1},
     ).sort("_id", 1).to_list(length=None)
     names = [doc["_id"] for doc in session_docs]

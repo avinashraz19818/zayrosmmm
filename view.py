@@ -1067,8 +1067,9 @@ async def heroku_scale_workers(quantity: int):
     quantity = max(1, int(quantity))
     if not IS_CONTROLLER_WORKER:
         return
-    if _LAST_HEROKU_WORKER_TARGET == quantity:
-        return
+    # Re-check formation on every reconciliation: an operator may have
+    # manually scaled to 20 while the desired shard count is 17. The controller
+    # must correct that drift instead of trusting an in-process cache.
     if not HEROKU_APP_NAME or not HEROKU_API_KEY:
         logger.warning(
             "Account sharding needs %s worker(s). Set HEROKU_APP_NAME and "

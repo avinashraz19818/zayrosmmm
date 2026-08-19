@@ -8,3 +8,7 @@ tgcrypto==1.2.5
 py-tgcalls==2.3.3
 ffmpeg-python==0.2.0
 pydub==0.25.1
+
+# Authenticated Heroku web dashboard
+Flask==3.1.1
+gunicorn==23.0.0

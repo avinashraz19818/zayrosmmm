@@ -15,6 +15,7 @@ import hashlib
 import io
 import logging
 import re
+import secrets
 import sys
 import datetime
 import random
@@ -68,7 +69,7 @@ from telethon.tl.types import (
 )
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorGridFSBucket
 from bson.objectid import ObjectId
-from pymongo import InsertOne, UpdateOne
+from pymongo import InsertOne, ReturnDocument, UpdateOne
 
 # Optional so the bot still boots on a host without ffmpeg/ntgcalls; every
 # live-audio path checks TGCALLS_OK first and reports the missing dependency
@@ -171,6 +172,8 @@ ACCOUNT_SHARDING = os.getenv("ACCOUNT_SHARDING", "true").strip().lower() not in 
 ACCOUNT_SHARD_SIZE = max(1, _env_int("ACCOUNT_SHARD_SIZE", 10))
 HEROKU_APP_NAME = os.getenv("HEROKU_APP_NAME", "").strip()
 HEROKU_API_KEY = os.getenv("HEROKU_API_KEY", "").strip()
+DASHBOARD_URL = os.getenv("DASHBOARD_URL", "").strip().rstrip("/")
+DASHBOARD_SESSION_SECRET = os.getenv("DASHBOARD_SESSION_SECRET", "").strip()
 WORKER_RECONCILE_INTERVAL = max(30, _env_int("WORKER_RECONCILE_INTERVAL", 60))
 DYNO_NAME = os.getenv("DYNO", "").strip()
 
@@ -614,6 +617,8 @@ col_settings = None
 storage_bucket = None
 col_storage = None
 col_account_shards = None
+col_dashboard_tasks = None
+col_dashboard_tokens = None
 storage_lock = None
 
 
@@ -621,7 +626,7 @@ def initialize_mongo_client():
     """Create Motor/GridFS objects on the current event loop."""
     global mongo_client, mdb, col_history, col_approved, col_clients
     global col_stats, col_settings, storage_bucket, col_storage
-    global col_account_shards, storage_lock
+    global col_account_shards, col_dashboard_tasks, col_dashboard_tokens, storage_lock
     if mongo_client is not None:
         return
     mongo_client = AsyncIOMotorClient(
@@ -643,6 +648,8 @@ def initialize_mongo_client():
     storage_bucket = AsyncIOMotorGridFSBucket(mdb, bucket_name=GRIDFS_BUCKET)
     col_storage = mdb["storage_manifest"]
     col_account_shards = mdb["account_shards"]
+    col_dashboard_tasks = mdb["dashboard_tasks"]
+    col_dashboard_tokens = mdb["dashboard_tokens"]
     storage_lock = asyncio.Lock()
     logger.info("MongoDB/GridFS client created")
 
@@ -1047,6 +1054,9 @@ async def ensure_database_indexes():
     await col_approved.create_index("user_id")
     await col_storage.create_index("gridfs_id")
     await col_account_shards.create_index([("slot", 1), ("owner", 1)])
+    await col_dashboard_tasks.create_index([("status", 1), ("worker_slot", 1), ("created_at", 1)])
+    await col_dashboard_tasks.create_index("parent_id")
+    await col_dashboard_tokens.create_index("expires_at", expireAfterSeconds=0)
 
 
 _LAST_HEROKU_WORKER_TARGET: Optional[int] = None
@@ -1298,6 +1308,220 @@ async def worker_shard_reconcile_task():
                 )
         except Exception as exc:
             logger.error("worker shard reconcile: %s", exc)
+
+
+async def _dashboard_join_local(params: dict) -> dict:
+    link = str(params.get("target", "")).strip()
+    ltype, target = parse_target(link)
+    if ltype not in ("public", "private"):
+        return {"ok": 0, "failed": len(acc_keys()), "error": "invalid channel link"}
+    keys = list(acc_keys())
+    result = {"ok": 0, "failed": 0}
+    sem = asyncio.Semaphore(JOIN_CONCURRENCY)
+
+    async def one(key):
+        async with sem:
+            client = acc_client(key)
+            try:
+                if ltype == "public":
+                    await client(JoinChannelRequest(target))
+                else:
+                    await client(ImportChatInviteRequest(target))
+                result["ok"] += 1
+                await log_activity(key, "DASHBOARD_JOIN", link, "Success")
+            except UserAlreadyParticipantError:
+                result["ok"] += 1
+            except Exception as exc:
+                result["failed"] += 1
+                await log_activity(key, "DASHBOARD_JOIN", link, str(exc)[:80])
+
+    await asyncio.gather(*(one(key) for key in keys))
+    return result
+
+
+async def _dashboard_leave_local(params: dict) -> dict:
+    link = str(params.get("target", "")).strip()
+    ltype, target = parse_target(link)
+    if not ltype:
+        return {"ok": 0, "failed": len(acc_keys()), "error": "invalid channel link"}
+    result = {"ok": 0, "failed": 0}
+    for key in list(acc_keys()):
+        client = acc_client(key)
+        try:
+            if ltype == "public":
+                await client(LeaveChannelRequest(target))
+            else:
+                entity = await client.get_entity(link)
+                await client.delete_dialog(entity)
+            result["ok"] += 1
+        except Exception:
+            result["failed"] += 1
+        await asyncio.sleep(0.05)
+    invalidate_peer_cache()
+    return result
+
+
+async def _dashboard_react_local(params: dict) -> dict:
+    link = str(params.get("target", "")).strip()
+    spec, message_id = parse_post_link(link)
+    if spec is None:
+        return {"ok": 0, "failed": len(acc_keys()), "error": "invalid post link"}
+    emoji = str(params.get("emoji", "")).strip() or random.choice(REACTION_EMOJIS)
+    result = {"ok": 0, "failed": 0}
+    for key in list(acc_keys()):
+        client = acc_client(key)
+        try:
+            peer = await resolve_peer(key, client, spec)
+            if peer is None:
+                result["failed"] += 1
+                continue
+            ok, _err = await send_reaction(client, peer, message_id, emoji)
+            result["ok" if ok else "failed"] += 1
+        except Exception:
+            result["failed"] += 1
+        await asyncio.sleep(0.05)
+    await increment_stats(reactions=result["ok"])
+    return result
+
+
+async def _dashboard_views_local(params: dict) -> dict:
+    link = str(params.get("target", "")).strip()
+    spec, message_id = parse_post_link(link)
+    if spec is None:
+        return {"ok": 0, "failed": len(acc_keys()), "error": "invalid post link"}
+    result = {"ok": 0, "failed": 0}
+    for key in list(acc_keys()):
+        client = acc_client(key)
+        try:
+            peer = await resolve_peer(key, client, spec)
+            if peer is None:
+                result["failed"] += 1
+                continue
+            ok, _err = await send_views(client, peer, [message_id])
+            result["ok" if ok else "failed"] += 1
+        except Exception:
+            result["failed"] += 1
+        await asyncio.sleep(0.05)
+    await increment_stats(views=result["ok"])
+    return result
+
+
+async def _dashboard_set_name_local(params: dict) -> dict:
+    name = str(params.get("name", "")).strip()
+    if not name:
+        return {"ok": 0, "failed": len(acc_keys()), "error": "name is empty"}
+    parts = name.split(None, 1)
+    result = {"ok": 0, "failed": 0}
+    for key in list(acc_keys()):
+        try:
+            await acc_client(key)(UpdateProfileRequest(
+                first_name=parts[0], last_name=parts[1] if len(parts) > 1 else ""))
+            ACCOUNTS[key].name = parts[0]
+            result["ok"] += 1
+        except Exception:
+            result["failed"] += 1
+    return result
+
+
+async def _dashboard_live_local(params: dict) -> dict:
+    action = str(params.get("mode", "stop"))
+    result = {"ok": 0, "failed": 0}
+    if action == "stop":
+        for chat_id, keys in list(LIVE_AUDIO.items()):
+            for key in list(keys):
+                await stop_live_audio(key, chat_id)
+                result["ok"] += 1
+            end_live_session(chat_id)
+        return result
+    if action == "rotate":
+        for chat_id in list(LIVE_AUDIO):
+            _out, into = await rotate_live_accounts(chat_id)
+            result["ok"] += into
+        return result
+    if action == "start":
+        target = str(params.get("target", "")).strip()
+        ltype, parsed = parse_target(target)
+        if ltype not in ("public", "private"):
+            return {"ok": 0, "failed": 1, "error": "invalid channel link"}
+        # Join/resolve with one local account, then let the subscription-aware
+        # live starter choose the configured live package for this shard.
+        probe = acc_keys()[0] if acc_keys() else None
+        if not probe:
+            return {"ok": 0, "failed": 1, "error": "no local accounts"}
+        client = acc_client(probe)
+        try:
+            if ltype == "public":
+                try:
+                    await client(JoinChannelRequest(parsed))
+                except UserAlreadyParticipantError:
+                    pass
+                entity = await client.get_entity(parsed)
+            else:
+                entity = await client.get_entity(target)
+            chat_id = utils.get_peer_id(entity)
+            call = await get_active_call(chat_id, [probe])
+            if call is None:
+                return {"ok": 0, "failed": 1, "error": "no active live stream"}
+            await process_live_stream_start(chat_id, call)
+            return {"ok": len(LIVE_AUDIO.get(chat_id, set())), "failed": 0}
+        except Exception as exc:
+            return {"ok": 0, "failed": 1, "error": str(exc)[:120]}
+    return {"ok": 0, "failed": 1, "error": "unknown live action"}
+
+
+async def run_dashboard_child_task(task: dict) -> dict:
+    action = task.get("action")
+    params = task.get("params") or {}
+    if action == "join":
+        return await _dashboard_join_local(params)
+    if action == "leave":
+        return await _dashboard_leave_local(params)
+    if action == "react":
+        return await _dashboard_react_local(params)
+    if action == "views":
+        return await _dashboard_views_local(params)
+    if action == "set_name":
+        return await _dashboard_set_name_local(params)
+    if action in {"live_start", "live_stop", "live_rotate"}:
+        params = dict(params)
+        params["mode"] = action[len("live_"):]
+        return await _dashboard_live_local(params)
+    return {"ok": 0, "failed": 1, "error": f"unsupported action: {action}"}
+
+
+async def dashboard_task_worker():
+    """Consume one dashboard child task for this worker shard at a time."""
+    while True:
+        await asyncio.sleep(1)
+        if col_dashboard_tasks is None:
+            continue
+        child = None
+        try:
+            child = await col_dashboard_tasks.find_one_and_update(
+                {"kind": "child", "worker_slot": WORKER_SLOT, "status": "queued"},
+                {"$set": {"status": "running", "worker_id": WORKER_INSTANCE_ID,
+                          "started_at": utcnow()}},
+                sort=[("created_at", 1)],
+                return_document=ReturnDocument.AFTER,
+            )
+            if not child:
+                continue
+            try:
+                result = await run_dashboard_child_task(child)
+                status = "done" if not result.get("error") else "partial"
+                await col_dashboard_tasks.update_one(
+                    {"_id": child["_id"]},
+                    {"$set": {"status": status, "result": result,
+                              "finished_at": utcnow()}},
+                )
+            except Exception as exc:
+                await col_dashboard_tasks.update_one(
+                    {"_id": child["_id"]},
+                    {"$set": {"status": "failed", "result": {"error": str(exc)[:200]},
+                              "finished_at": utcnow()}},
+                )
+        except Exception as exc:
+            logger.error("dashboard task worker: %s", exc)
 
 
 # ═══════════════════════ ACCOUNT STORE (MongoDB-backed sessions) ═══════════════════════
@@ -4669,6 +4893,27 @@ async def show_help(event):
 
 
 # ═══════════════════════ BOT ═══════════════════════
+async def create_dashboard_token(owner_id: int) -> Optional[str]:
+    if col_dashboard_tokens is None:
+        return None
+    raw = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    await col_dashboard_tokens.insert_one({
+        "_id": token_hash,
+        "owner_id": int(owner_id),
+        "created_at": utcnow(),
+        "expires_at": utcnow() + datetime.timedelta(minutes=15),
+        "used": False,
+    })
+    base = DASHBOARD_URL or (
+        f"https://{HEROKU_APP_NAME}.herokuapp.com" if HEROKU_APP_NAME else ""
+    )
+    if not base:
+        return None
+    return f"{base}/auth/{raw}"
+
+
+# ═══════════════════════ BOT ═══════════════════════
 # The bot account is authenticated by BOT_TOKEN, so it does not need a local
 # SQLite file. A MemorySession prevents Telethon from opening
 # bot_session.session during module import and then colliding with the GridFS
@@ -4698,6 +4943,23 @@ async def cmd_start(event):
 async def cmd_id(event):
     await event.respond(card(E_PERSON, "Your ID", [
         f"<code>{event.sender_id}</code>",
+    ]))
+
+
+@bot.on(events.NewMessage(pattern=r"^/dashboard$"))
+async def cmd_dashboard(event):
+    if event.sender_id not in OWNER_IDS:
+        return await event.respond(card(E_LOCK, "Owner Only", [S("Not allowed.")]))
+    link = await create_dashboard_token(event.sender_id)
+    if not link:
+        return await event.respond(card(E_WARN, "Dashboard URL Missing", [
+            S("Set DASHBOARD_URL or HEROKU_APP_NAME in Heroku Config Vars first."),
+        ]))
+    await event.respond(card(E_CHECK, "Dashboard Login", [
+        S("Open this one-time dashboard link within 15 minutes:"),
+        f"<code>{esc(link)}</code>",
+        "",
+        S("Do not forward this link. It expires after one use or 15 minutes."),
     ]))
 
 
@@ -7120,6 +7382,7 @@ async def main():
         asyncio.create_task(expiry_check_task())
     asyncio.create_task(keep_alive_task())
     asyncio.create_task(onboard_sweep_task())
+    asyncio.create_task(dashboard_task_worker())
     if sharding_runtime_enabled():
         asyncio.create_task(worker_shard_reconcile_task())
 

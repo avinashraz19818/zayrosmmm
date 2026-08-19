@@ -12,9 +12,13 @@
     }
   ],
   "formation": {
+    "web": {
+      "quantity": 1,
+      "size": "standard-1X"
+    },
     "worker": {
       "quantity": 1,
-      "size": "basic"
+      "size": "standard-1X"
     }
   },
   "env": {
@@ -69,6 +73,14 @@
     "WORKER_RECONCILE_INTERVAL": {
       "description": "Seconds between account shard/lease reconciliation",
       "value": "60"
+    },
+    "DASHBOARD_URL": {
+      "description": "Public HTTPS URL of the Heroku web dashboard",
+      "required": false
+    },
+    "DASHBOARD_SESSION_SECRET": {
+      "description": "Random secret used to sign dashboard browser sessions",
+      "required": false
     }
   }
 }

@@ -4036,17 +4036,22 @@ async def expiry_check_task():
             logger.error(f"expiry task: {e}")
 
 
-async def global_account_totals() -> Optional[Tuple[int, int, int]]:
-    """Return (total sessions, leased/online sessions, worker count)."""
+async def global_account_totals() -> Optional[Tuple[int, int, int, int]]:
+    """Return (total sessions, leased accounts, shard count, live workers)."""
     if not sharding_runtime_enabled() or col_account_shards is None:
         return None
+    now = utcnow()
     total = await col_account_shards.count_documents({})
-    online = await col_account_shards.count_documents({
-        "lease_until": {"$gt": utcnow()}
+    leased_accounts = await col_account_shards.count_documents({
+        "lease_until": {"$gt": now}
+    })
+    owners = await col_account_shards.distinct("owner", {
+        "lease_until": {"$gt": now},
+        "owner": {"$nin": [None, ""]},
     })
     docs = await col_account_shards.find({}, {"slot": 1}).to_list(length=None)
     workers = max((int(d.get("slot", 0) or 0) for d in docs), default=-1) + 1
-    return total, online, workers
+    return total, leased_accounts, workers, len(owners)
 
 
 # ═══════════════════════ SCREENS ═══════════════════════
@@ -4078,11 +4083,11 @@ async def show_menu(event, user_id, edit=True):
     account_line = f"{E_PERSON} {S('Accounts online')}: <b>{online}</b>"
     global_totals = await global_account_totals()
     if global_totals is not None:
-        total, active, workers = global_totals
+        total, leased_accounts, workers, live_workers = global_totals
         online = total
         account_line = (f"{E_PERSON} {S('Accounts total')}: <b>{total}</b> "
-                        f"<i>({active} {S('workers online')}, "
-                        f"{workers} {S('shards')})</i>")
+                        f"<i>({leased_accounts} {S('accounts leased')}, "
+                        f"{live_workers}/{workers} {S('workers online')})</i>")
     problems = len(PROBLEM_SESSIONS)
     joins = await get_today_joins()
     try:
@@ -4165,10 +4170,10 @@ async def show_accounts_menu(event):
     shard_line = None
     global_totals = await global_account_totals()
     if global_totals is not None:
-        total, active, workers = global_totals
+        total, leased_accounts, workers, live_workers = global_totals
         online = total
         files = total
-        shard_line = field(E_REFRESH, "Workers", f"{workers} x {ACCOUNT_SHARD_SIZE}")
+        shard_line = field(E_REFRESH, "Workers", f"{live_workers}/{workers} online; {ACCOUNT_SHARD_SIZE} per shard")
     dead = sum(1 for a in ACCOUNTS.values() if a.state == "dead")
     text = card(E_PERSON, "Accounts", [
         field(E_GREEN, "Accounts total", str(online)),
@@ -4610,7 +4615,9 @@ async def show_stats(event):
 
     account_display = str(acc_count())
     if global_totals := await global_account_totals():
-        account_display = f"{global_totals[0]} ({global_totals[1]} leased)"
+        account_display = (f"{global_totals[0]} total "
+                          f"({global_totals[1]} leased, "
+                          f"{global_totals[3]}/{global_totals[2]} workers)")
 
     text = card(E_CHART, "Statistics", [
         field(E_PERSON, "Accounts total", account_display),

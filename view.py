@@ -1320,6 +1320,7 @@ async def _dashboard_join_local(params: dict) -> dict:
     if ltype not in ("public", "private"):
         return {"ok": 0, "failed": len(acc_keys()), "error": "invalid channel link"}
     keys = list(acc_keys())
+    successful = []
     result = {"ok": 0, "failed": 0}
     sem = asyncio.Semaphore(JOIN_CONCURRENCY)
 
@@ -1332,14 +1333,26 @@ async def _dashboard_join_local(params: dict) -> dict:
                 else:
                     await client(ImportChatInviteRequest(target))
                 result["ok"] += 1
+                successful.append(key)
                 await log_activity(key, "DASHBOARD_JOIN", link, "Success")
             except UserAlreadyParticipantError:
                 result["ok"] += 1
+                successful.append(key)
             except Exception as exc:
                 result["failed"] += 1
                 await log_activity(key, "DASHBOARD_JOIN", link, str(exc)[:80])
 
     await asyncio.gather(*(one(key) for key in keys))
+    client_id = str(params.get("client_id", "")).strip()
+    if client_id and successful:
+        try:
+            await col_clients.update_one(
+                {"_id": ObjectId(client_id)},
+                {"$addToSet": {"joined_accounts": {"$each": successful}},
+                 "$set": {"updated_at": utcnow()}},
+            )
+        except Exception as exc:
+            logger.warning("dashboard client membership save failed: %s", exc)
     return result
 
 

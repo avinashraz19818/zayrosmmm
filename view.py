@@ -1339,7 +1339,7 @@ async def _dashboard_join_local(params: dict) -> dict:
     ltype, target = parse_target(link)
     if ltype not in ("public", "private"):
         return {"ok": 0, "failed": len(acc_keys()), "error": "invalid channel link"}
-    keys = list(acc_keys())
+    keys = worker_task_keys(int(params.get("limit", 0) or 0))
     successful = []
     result = {"ok": 0, "failed": 0}
     sem = asyncio.Semaphore(JOIN_CONCURRENCY)
@@ -1382,10 +1382,11 @@ async def _dashboard_leave_local(params: dict) -> dict:
     if not ltype:
         return {"ok": 0, "failed": len(acc_keys()), "error": "invalid channel link"}
     result = {"ok": 0, "failed": 0}
-    for key in list(acc_keys()):
+    for key in worker_task_keys(int(params.get("limit", 0) or 0)):
         client = acc_client(key)
         try:
             if ltype == "public":
+
                 await client(LeaveChannelRequest(target))
             else:
                 entity = await client.get_entity(link)
@@ -1403,17 +1404,20 @@ async def _dashboard_react_local(params: dict) -> dict:
     spec, message_id = parse_post_link(link)
     if spec is None:
         return {"ok": 0, "failed": len(acc_keys()), "error": "invalid post link"}
-    emoji = str(params.get("emoji", "")).strip() or random.choice(REACTION_EMOJIS)
+    emojis = params.get("emojis") or [str(params.get("emoji", "")).strip() or random.choice(REACTION_EMOJIS)]
+    if isinstance(emojis, str):
+        emojis = [emojis]
     result = {"ok": 0, "failed": 0}
-    for key in list(acc_keys()):
+    for key in worker_task_keys(int(params.get("limit", 0) or 0)):
         client = acc_client(key)
         try:
             peer = await resolve_peer(key, client, spec)
             if peer is None:
                 result["failed"] += 1
                 continue
-            ok, _err = await send_reaction(client, peer, message_id, emoji)
-            result["ok" if ok else "failed"] += 1
+            for emoji in emojis:
+                ok, _err = await send_reaction(client, peer, message_id, emoji)
+                result["ok" if ok else "failed"] += 1
         except Exception:
             result["failed"] += 1
         await asyncio.sleep(0.05)
@@ -1427,7 +1431,7 @@ async def _dashboard_views_local(params: dict) -> dict:
     if spec is None:
         return {"ok": 0, "failed": len(acc_keys()), "error": "invalid post link"}
     result = {"ok": 0, "failed": 0}
-    for key in list(acc_keys()):
+    for key in worker_task_keys(int(params.get("limit", 0) or 0)):
         client = acc_client(key)
         try:
             peer = await resolve_peer(key, client, spec)
@@ -1449,7 +1453,7 @@ async def _dashboard_set_name_local(params: dict) -> dict:
         return {"ok": 0, "failed": len(acc_keys()), "error": "name is empty"}
     parts = name.split(None, 1)
     result = {"ok": 0, "failed": 0}
-    for key in list(acc_keys()):
+    for key in worker_task_keys(int(params.get("limit", 0) or 0)):
         try:
             await acc_client(key)(UpdateProfileRequest(
                 first_name=parts[0], last_name=parts[1] if len(parts) > 1 else ""))
@@ -1467,7 +1471,7 @@ async def _dashboard_random_names_local(params: dict) -> dict:
     if not names:
         return {"ok": 0, "failed": len(acc_keys()), "error": "names are empty"}
     result = {"ok": 0, "failed": 0}
-    for key in list(acc_keys()):
+    for key in worker_task_keys(int(params.get("limit", 0) or 0)):
         try:
             name = random.choice(names)
             parts = name.split(None, 1)
@@ -1489,7 +1493,7 @@ async def _dashboard_profile_photo_local(params: dict) -> dict:
         return {"ok": 0, "failed": len(acc_keys()), "error": "photo upload unavailable"}
     result = {"ok": 0, "failed": 0}
     try:
-        for key in list(acc_keys()):
+        for key in worker_task_keys(int(params.get("limit", 0) or 0)):
             try:
                 uploaded = await acc_client(key).upload_file(path)
                 await acc_client(key)(UploadProfilePhotoRequest(file=uploaded))
@@ -1782,6 +1786,25 @@ def acc_keys() -> List[str]:
 
 def acc_count() -> int:
     return len(acc_keys())
+
+
+def fleet_account_count() -> int:
+    """Total assigned accounts for UI limits; worker actions stay local."""
+    if sharding_runtime_enabled() and ACCOUNT_SLOT_BY_KEY:
+        return len(ACCOUNT_SLOT_BY_KEY)
+    return acc_count()
+
+
+def worker_task_keys(limit: int = 0) -> List[str]:
+    """Global deterministic account selection filtered to this worker shard."""
+    if sharding_runtime_enabled() and ACCOUNT_SLOT_BY_KEY:
+        ordered = sorted(ACCOUNT_SLOT_BY_KEY, key=lambda key: (
+            ACCOUNT_SLOT_BY_KEY.get(key, 10**9), str(key)))
+        if limit > 0:
+            ordered = ordered[:limit]
+        return [key for key in ordered if local_worker_account(key)]
+    keys = list(acc_keys())
+    return keys[:limit] if limit > 0 else keys
 
 
 def acc_client(key: str) -> Optional[TelegramClient]:
@@ -6121,7 +6144,7 @@ async def handle_qty(event, data):
         return await show_menu(event, event.sender_id)
 
     prefix, _, choice = data.rpartition("_")
-    total = acc_count()
+    total = fleet_account_count()
 
     if choice == "custom":
         state["step"] = "custom_qty"
@@ -6140,6 +6163,27 @@ async def handle_qty(event, data):
 
 async def run_task(event, state, count):
     t = state["type"]
+    if sharding_runtime_enabled() and t in {"join", "react_view", "multi_react", "views"}:
+        task_ids = []
+        if t == "join":
+            for info in state["links_data"]:
+                task_ids.append(await enqueue_internal_worker_fanout(
+                    "join", {"target": info["link"], "limit": count}))
+        elif t in {"react_view", "multi_react"}:
+            emojis = state.get("emojis") if t == "multi_react" else [state.get("emoji", "")]
+            for info in state["links_data"]:
+                task_ids.append(await enqueue_internal_worker_fanout(
+                    "react", {"target": info["link"], "emojis": emojis, "limit": count}))
+        elif t == "views":
+            for link in state["links"]:
+                task_ids.append(await enqueue_internal_worker_fanout(
+                    "views", {"target": link, "limit": count}))
+        return await event.respond(card(E_CHECK, "Task Queued", [
+            field(E_PERSON, "Accounts across workers", str(count)),
+            field(E_REFRESH, "Tasks", str(len(task_ids))),
+            "",
+            S("Each worker will use only its assigned accounts."),
+        ]), buttons=kb_nav())
     if t == "join":
         await execute_join(event, state, count)
     elif t == "react_view":
@@ -6178,7 +6222,7 @@ def upgrade_prompt(doc: dict, step: str) -> str:
         # instead of backing out to the home screen to look it up.
         head = [f"{S(pos)} {DOT} {S(label)}",
                 "",
-                field(E_GREEN, "Accounts online", str(acc_count())),
+                field(E_GREEN, "Accounts across workers", str(fleet_account_count())),
                 field(icon, "Current", str(current))]
         return card(icon, "Upgrade Package", head + extra + [
             "",
@@ -6263,9 +6307,9 @@ def upgrade_summary(state) -> str:
     if need > n_acc:
         warn.append(f"{E_WARN} {S('Accounts raised to')} <b>{need}</b> "
                     f"{S('so reactions and views fit.')}")
-    if need > acc_count():
-        warn.append(f"{E_WARN} {S('Only')} <b>{acc_count()}</b> "
-                    f"{S('accounts are online — the rest cannot join yet.')}")
+    if need > fleet_account_count():
+        warn.append(f"{E_WARN} {S('Only')} <b>{fleet_account_count()}</b> "
+                    f"{S('accounts are available across workers — the rest cannot join yet.')}")
     if not changed:
         warn.append(f"{E_CROSS} {S('Nothing would change.')}")
 
@@ -6360,6 +6404,8 @@ async def apply_upgrade(event, state):
     task_states.pop(event.chat_id, None)
     invalidate_peer_cache()
     await setup_channel_monitors()
+    if sharding_runtime_enabled():
+        await enqueue_internal_worker_fanout("onboard", {"subscription_id": cid})
 
     fresh = await get_client_doc(cid)
     receipt = card(E_CHECK, "Package Upgraded", [
@@ -6745,7 +6791,7 @@ async def route_message(event, state, text):
 async def finish_custom_qty(event, state, text):
     if not text.isdigit() or int(text) < 1:
         return await bad(event, "Send a whole number of accounts.")
-    count = min(int(text), acc_count())
+    count = min(int(text), fleet_account_count())
     task_states.pop(event.chat_id, None)
     await run_task(event, state, count)
 

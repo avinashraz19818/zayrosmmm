@@ -7515,10 +7515,15 @@ async def handle_zip_import(event):
 
             if sharding_runtime_enabled():
                 # Do not open every imported session on worker.1. Persist the
-                # file, let Mongo assign its shard, and let the owning worker
-                # probe it. This is what prevents a ZIP import from briefly
-                # using all accounts on the controller IP.
-                result["state"] = "queued"
+                # file first, let Mongo assign its shard, and let the owning
+                # worker probe it. This is what prevents a ZIP import from
+                # briefly using all accounts on the controller IP.
+                try:
+                    await persist_session_bundle(dest)
+                    result["state"] = "queued"
+                except Exception as exc:
+                    result["state"] = "unknown"
+                    logger.warning("%s: queued session save failed: %s", stem, exc)
                 return result
 
             try:

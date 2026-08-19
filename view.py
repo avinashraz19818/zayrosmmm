@@ -4036,6 +4036,19 @@ async def expiry_check_task():
             logger.error(f"expiry task: {e}")
 
 
+async def global_account_totals() -> Optional[Tuple[int, int, int]]:
+    """Return (total sessions, leased/online sessions, worker count)."""
+    if not sharding_runtime_enabled() or col_account_shards is None:
+        return None
+    total = await col_account_shards.count_documents({})
+    online = await col_account_shards.count_documents({
+        "lease_until": {"$gt": utcnow()}
+    })
+    docs = await col_account_shards.find({}, {"slot": 1}).to_list(length=None)
+    workers = max((int(d.get("slot", 0) or 0) for d in docs), default=-1) + 1
+    return total, online, workers
+
+
 # ═══════════════════════ SCREENS ═══════════════════════
 async def safe_callback_answer(event, text="", alert=False):
     """Answer a callback if it is still fresh; expired taps are harmless."""
@@ -4062,6 +4075,14 @@ async def safe_edit(event, text, buttons=None):
 
 async def show_menu(event, user_id, edit=True):
     online = acc_count()
+    account_line = f"{E_PERSON} {S('Accounts online')}: <b>{online}</b>"
+    global_totals = await global_account_totals()
+    if global_totals is not None:
+        total, active, workers = global_totals
+        online = total
+        account_line = (f"{E_PERSON} {S('Accounts total')}: <b>{total}</b> "
+                        f"<i>({active} {S('workers online')}, "
+                        f"{workers} {S('shards')})</i>")
     problems = len(PROBLEM_SESSIONS)
     joins = await get_today_joins()
     try:
@@ -4072,8 +4093,8 @@ async def show_menu(event, user_id, edit=True):
 
     is_owner = user_id in OWNER_IDS
     text = card(E_ROCKET, "Reaction & Views Panel", [
-        f"{E_PERSON} {S('Accounts online')}: <b>{online}</b>"
-        + (f"  <i>({problems} {S('need review')})</i>" if problems else ""),
+        account_line
+        + (f"  <i>({problems} {S('need review on this worker')})</i>" if problems else ""),
         field(E_CROWN, "Clients", f"{active_subs} {S('active')} / {total_clients}"),
         field(E_CHART, "Joins today", str(joins)),
         field(E_CLOCK, "Uptime", uptime_str()),
@@ -4141,11 +4162,19 @@ async def scan_dead_accounts() -> List[str]:
 async def show_accounts_menu(event):
     online = acc_count()
     files = len([f for f in os.listdir(SESSIONS_DIR) if f.endswith(".session")])
+    shard_line = None
+    global_totals = await global_account_totals()
+    if global_totals is not None:
+        total, active, workers = global_totals
+        online = total
+        files = total
+        shard_line = field(E_REFRESH, "Workers", f"{workers} x {ACCOUNT_SHARD_SIZE}")
     dead = sum(1 for a in ACCOUNTS.values() if a.state == "dead")
     text = card(E_PERSON, "Accounts", [
-        field(E_GREEN, "Online", str(online)),
-        field(E_PAGE, "Session files", str(files)),
-        field(E_WARN, "Need review", str(len(PROBLEM_SESSIONS))),
+        field(E_GREEN, "Accounts total", str(online)),
+        field(E_PAGE, "Session files total", str(files)),
+        shard_line,
+        field(E_WARN, "Need review on this worker", str(len(PROBLEM_SESSIONS))),
         field(E_RED, "Detected dead", str(dead)),
         field(E_LOCK, "Frozen (cannot join)", str(sum(1 for k in ACCOUNTS
                                                       if is_frozen(k)))),
@@ -4169,6 +4198,40 @@ async def show_accounts_menu(event):
 
 
 async def show_accounts_list(event, page=1):
+    if sharding_runtime_enabled() and col_account_shards is not None:
+        records = await col_account_shards.find({}).sort("_id", 1).to_list(length=None)
+        if not records:
+            return await safe_edit(event, card(E_CROSS, "No Accounts", [
+                S("No account shard has been registered yet."),
+            ]), kb_nav("menu_accounts"))
+        rows, page, total_pages = paginate(records, page)
+        lines, buttons = [], []
+        now = utcnow()
+        start = (page - 1) * PER_PAGE
+        for index, record in enumerate(rows, start + 1):
+            key = str(record.get("account_key") or record.get("_id", ""))
+            slot = int(record.get("slot", 0) or 0) + 1
+            lease = record.get("lease_until")
+            online = bool(lease and lease > now)
+            dot = "🟢" if online else "🟡"
+            lines.append(f"{dot} <b>{index}.</b> <code>{esc(key)}</code> "
+                         f"<i>worker.{slot}</i>")
+            local_key = key if key in ACCOUNTS else None
+            if local_key:
+                buttons.append([Button.inline(
+                    f"⚙ {ACCOUNTS[local_key].label[:15]}",
+                    f"acc_mgmt_{local_key}".encode())])
+            else:
+                buttons.append([Button.inline(
+                    f"{dot} worker.{slot} — {str(key)[:15]}", b"noop")])
+        buttons += pager(page, total_pages, "acc", "menu_accounts")
+        return await safe_edit(
+            event,
+            card(E_PERSON, "All Account Shards", lines,
+                 footer=field(E_CHART, "Total accounts", str(len(records)))),
+            buttons,
+        )
+
     keys = sorted(acc_keys())
     if not keys:
         return await safe_edit(event, card(E_CROSS, "No Accounts", [
@@ -4545,8 +4608,12 @@ async def show_stats(event):
     except Exception:
         spread = "-"
 
+    account_display = str(acc_count())
+    if global_totals := await global_account_totals():
+        account_display = f"{global_totals[0]} ({global_totals[1]} leased)"
+
     text = card(E_CHART, "Statistics", [
-        field(E_PERSON, "Accounts online", str(acc_count())),
+        field(E_PERSON, "Accounts total", account_display),
         field(E_CHANNEL, "Channels per account", spread),
         field(E_WARN, "Sessions to review", str(len(PROBLEM_SESSIONS))),
         field(E_TRASH, "In trash", str(len(trash_entries()))),

@@ -270,6 +270,7 @@ tbody tr:hover { background: rgba(255, 255, 255, 0.02); }
 .pill.ok { background: var(--green-glow); color: var(--green); border: 1px solid rgba(16, 185, 129, 0.3); }
 .pill.bad { background: var(--red-glow); color: var(--red); border: 1px solid rgba(239, 68, 68, 0.3); }
 .pill.running { background: var(--blue-glow); color: var(--blue); border: 1px solid rgba(59, 130, 246, 0.3); }
+.pill.partial { background: var(--yellow-glow); color: var(--yellow); border: 1px solid rgba(245, 158, 11, 0.3); }
 
 /* Forms & Grids */
 .grid-forms {
@@ -342,6 +343,121 @@ tbody tr:hover { background: rgba(255, 255, 255, 0.02); }
 .btn.secondary { background: rgba(255, 255, 255, 0.08); box-shadow: none; border: 1px solid var(--line); }
 .btn.secondary:hover { background: rgba(255, 255, 255, 0.12); }
 .btn.sm { padding: 6px 10px; font-size: 11px; border-radius: 6px; }
+.btn.icon { padding: 8px 10px; min-width: 38px; }
+
+.progress-wrap {
+  min-width: 118px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.progress {
+  width: 82px;
+  height: 7px;
+  overflow: hidden;
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+.progress > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #22c55e, #34d399);
+  transition: width .3s ease;
+}
+.progress-wrap small { color: var(--muted); font-size: 11px; min-width: 30px; }
+.activity-row { cursor: pointer; }
+.activity-row:hover { background: rgba(59, 130, 246, .08) !important; }
+.activity-target {
+  display: block;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #cbd5e1;
+}
+.filter-bar {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+.filter-bar input, .filter-bar select {
+  min-width: 150px;
+  padding: 9px 12px;
+  background: rgba(10, 15, 26, .75);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: #fff;
+  font: inherit;
+  outline: none;
+}
+.filter-bar input { flex: 1; min-width: 220px; }
+.filter-bar input:focus, .filter-bar select:focus { border-color: var(--blue); }
+
+/* Activity detail modal */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 300;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+  background: rgba(2, 6, 23, .78);
+  backdrop-filter: blur(8px);
+}
+.modal {
+  width: min(760px, 100%);
+  max-height: min(760px, 92vh);
+  overflow: auto;
+  background: #111a2b;
+  border: 1px solid var(--line-strong);
+  border-radius: 16px;
+  padding: 20px;
+  box-shadow: 0 24px 80px rgba(0,0,0,.55);
+}
+.modal-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+.modal-head h3 { font-size: 18px; }
+.detail-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 16px;
+}
+.detail-stat {
+  padding: 12px;
+  border-radius: 10px;
+  background: rgba(255,255,255,.04);
+  border: 1px solid var(--line);
+}
+.detail-stat small { display: block; color: var(--muted); font-size: 10px; text-transform: uppercase; }
+.detail-stat strong { display: block; margin-top: 4px; font-size: 18px; }
+.detail-error { color: var(--red); max-width: 260px; white-space: normal; }
+.detail-code {
+  display: block;
+  max-height: 180px;
+  overflow: auto;
+  padding: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #cbd5e1;
+  background: rgba(0,0,0,.2);
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+@media (max-width: 600px) {
+  .detail-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .activity-target { max-width: 160px; }
+}
 
 .result-box {
   margin-top: 20px;
@@ -393,6 +509,7 @@ tbody tr:hover { background: rgba(255, 255, 255, 0.02); }
   <div class="nav">
     <a href="#" data-page="dashboard" class="active">Dashboard</a>
     <a href="#" data-page="actions">Actions</a>
+    <a href="#" data-page="sessions">Sessions</a>
     <a href="#" data-page="accounts">Accounts</a>
     <a href="#" data-page="plans">Plans</a>
     <a href="#" data-page="activity">Activity</a>
@@ -403,10 +520,12 @@ tbody tr:hover { background: rgba(255, 255, 255, 0.02); }
 <main class="wrap">
   <div id="app"></div>
 </main>
+<div id="modal-root"></div>
 
 <script>
 const app = document.getElementById('app');
 let timer = null;
+let activityFilters = { search: '', action: 'all', status: 'all' };
 
 const esc = x => String(x ?? '').replace(/[&<>"']/g, m => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
@@ -427,7 +546,7 @@ function nav(page) {
   document.querySelectorAll('[data-page]').forEach(a => a.classList.toggle('active', a.dataset.page === page));
   clearInterval(timer);
   timer = null;
-  const routes = { dashboard, actions, accounts, plans, activity };
+  const routes = { dashboard, actions, sessions, accounts, plans, activity };
   (routes[page] || dashboard)();
 }
 
@@ -503,6 +622,7 @@ async function dashboard() {
             <th>Time</th>
             <th>Action</th>
             <th>Target</th>
+            <th>By</th>
             <th>Progress</th>
             <th>Success</th>
             <th>Failed</th>
@@ -515,12 +635,13 @@ async function dashboard() {
               <td>${esc(t.when)}</td>
               <td><strong>${esc(t.action)}</strong></td>
               <td>${esc(t.target || '-')}</td>
-              <td>${t.progress}%</td>
+              <td><span class="pill">${esc(t.by || 'auto')}</span></td>
+              <td>${progressHtml(t.progress)}</td>
               <td class="green">${t.ok}</td>
               <td class="red">${t.fail}</td>
-              <td><span class="pill ${t.status === 'done' ? 'ok' : t.status === 'failed' ? 'bad' : 'running'}">${esc(t.status)}</span></td>
+              <td><span class="pill ${t.status === 'done' ? 'ok' : t.status === 'failed' ? 'bad' : t.status === 'partial' ? 'partial' : 'running'}">${esc(t.status)}</span></td>
             </tr>
-          `).join('') : '<tr><td colspan="7" style="text-align:center;color:var(--muted)">No recent tasks</td></tr>'}
+          `).join('') : '<tr><td colspan="8" style="text-align:center;color:var(--muted)">No recent tasks</td></tr>'}
         </tbody>
       </table>
     </div>
@@ -605,21 +726,24 @@ async function uploadZip() {
   resText.innerText = 'Uploading...';
   let d = await get('/api/session-import', { method: 'POST', body: fd });
   resText.innerText = d?.error ? `❌ ${d.error}` : `✅ Queued Import: Task ${d?.id || ''}`;
-  setTimeout(accounts, 1500);
+  setTimeout(sessions, 1500);
 }
 
-async function accounts() {
+async function sessions() {
   let d = await get('/api/sessions');
   if (!d) return;
 
   app.innerHTML = `
     <div class="page-header">
-      <h1>Accounts & Sessions</h1>
-      <span class="pill">${d.rows.length} Total Loaded</span>
+      <div>
+        <h1>Sessions</h1>
+        <div style="color:var(--muted); margin-top:4px;">Persistent MongoDB/GridFS session storage</div>
+      </div>
+      <span class="pill ok">${d.rows.length} Stored</span>
     </div>
 
     <div class="form" style="margin-bottom: 20px;">
-      <h3>Bulk Session Import</h3>
+      <h3>📦 Bulk Session Import</h3>
       <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:center;">
         <input id="zip-file" type="file" accept=".zip" style="margin-bottom:0; max-width:320px;">
         <button class="btn" onclick="uploadZip()">Upload ZIP Archive</button>
@@ -650,6 +774,64 @@ async function accounts() {
       </table>
     </div>
   `;
+  if (!timer) timer = setInterval(sessions, 15000);
+}
+
+async function accounts() {
+  let d = await get('/api/sessions');
+  if (!d) return;
+  const total = d.rows.length;
+  const online = d.rows.filter(x => x.online).length;
+  const workers = {};
+  d.rows.forEach(x => {
+    const key = `worker.${x.slot + 1}`;
+    workers[key] ||= { total: 0, online: 0 };
+    workers[key].total += 1;
+    if (x.online) workers[key].online += 1;
+  });
+
+  app.innerHTML = `
+    <div class="page-header">
+      <div>
+        <h1>Accounts</h1>
+        <div style="color:var(--muted); margin-top:4px;">Live account ownership and worker health</div>
+      </div>
+      <button class="btn secondary" onclick="accounts()">↻ Refresh</button>
+    </div>
+    <div class="cards">
+      <div class="card"><div class="label">Total Accounts</div><div class="num">${total}</div></div>
+      <div class="card"><div class="label">Online / Leased</div><div class="num green">${online}</div></div>
+      <div class="card"><div class="label">Offline / Waiting</div><div class="num yellow">${Math.max(0, total - online)}</div></div>
+      <div class="card"><div class="label">Worker Shards</div><div class="num blue">${Object.keys(workers).length}</div></div>
+    </div>
+    <h2>Worker Health</h2>
+    <div class="cards">
+      ${Object.keys(workers).length ? Object.entries(workers).map(([name, x]) => `
+        <div class="card">
+          <div class="label">${name}</div>
+          <div class="num ${x.online === x.total ? 'green' : 'yellow'}">${x.online}/${x.total}</div>
+          <div style="color:var(--muted);font-size:12px;margin-top:4px;">accounts leased</div>
+        </div>
+      `).join('') : '<div class="result-box">No worker shard records found.</div>'}
+    </div>
+    <h2>Account Ownership</h2>
+    <div class="panel">
+      <table>
+        <thead><tr><th>Account</th><th>Worker</th><th>Lease</th><th>Last Update</th></tr></thead>
+        <tbody>
+          ${d.rows.length ? d.rows.map(x => `
+            <tr>
+              <td><strong>${esc(x.account)}</strong></td>
+              <td><span class="pill">worker.${x.slot + 1}</span></td>
+              <td><span class="pill ${x.online ? 'ok' : 'bad'}">${x.online ? 'Online' : 'Waiting'}</span></td>
+              <td>${esc(x.updated)}</td>
+            </tr>
+          `).join('') : '<tr><td colspan="4" style="text-align:center;color:var(--muted)">No account records</td></tr>'}
+        </tbody>
+      </table>
+    </div>
+  `;
+  if (!timer) timer = setInterval(accounts, 15000);
 }
 
 /* --- CLIENT PLANS --- */
@@ -761,41 +943,153 @@ async function plans() {
   `;
 }
 
-/* --- ACTIVITY LOGS --- */
+/* --- ACTIVITY / TASK QUEUE --- */
+function progressHtml(value) {
+  const pct = Math.max(0, Math.min(100, Number(value || 0)));
+  return `<div class="progress-wrap"><div class="progress"><span style="width:${pct}%"></span></div><small>${pct}%</small></div>`;
+}
+
+function activityFilter() {
+  const input = document.getElementById('activity-search');
+  const action = document.getElementById('activity-action');
+  const status = document.getElementById('activity-status');
+  if (input) activityFilters.search = input.value.toLowerCase().trim();
+  if (action) activityFilters.action = action.value;
+  if (status) activityFilters.status = status.value;
+  document.querySelectorAll('.activity-row').forEach(row => {
+    const matchesSearch = !activityFilters.search || row.dataset.search.includes(activityFilters.search);
+    const matchesAction = activityFilters.action === 'all' || row.dataset.action === activityFilters.action;
+    const matchesStatus = activityFilters.status === 'all' || row.dataset.status === activityFilters.status;
+    row.style.display = matchesSearch && matchesAction && matchesStatus ? '' : 'none';
+  });
+}
+
+function closeTask() {
+  document.getElementById('modal-root').innerHTML = '';
+}
+
+async function openTask(id) {
+  const modalRoot = document.getElementById('modal-root');
+  modalRoot.innerHTML = `<div class="modal-backdrop"><div class="modal"><div class="result-box">Loading task details...</div></div></div>`;
+  const d = await get('/api/activity/' + encodeURIComponent(id));
+  if (!d) { closeTask(); return; }
+  const t = d.task || {};
+  const params = d.params || {};
+  const parameterText = Object.keys(params).length ? JSON.stringify(params, null, 2) : 'No parameters';
+  modalRoot.innerHTML = `
+    <div class="modal-backdrop" onclick="closeTask()">
+      <div class="modal" onclick="event.stopPropagation()">
+        <div class="modal-head">
+          <div>
+            <h3>${esc(t.action || 'Task')} <span class="pill ${t.status === 'done' ? 'ok' : t.status === 'failed' ? 'bad' : t.status === 'partial' ? 'partial' : 'running'}">${esc((t.status || 'queued').toUpperCase())}</span></h3>
+          <div style="color:var(--muted);font-size:12px;margin-top:5px;">${esc(t.target || '-')} · ${esc(t.by || 'auto')}</div>
+          </div>
+          <button class="btn secondary icon" onclick="closeTask()">✕</button>
+        </div>
+        <div class="detail-grid">
+          <div class="detail-stat"><small>Progress</small><strong>${t.progress || 0}%</strong></div>
+          <div class="detail-stat"><small>OK</small><strong class="green">${t.ok || 0}</strong></div>
+          <div class="detail-stat"><small>Fail</small><strong class="red">${t.fail || 0}</strong></div>
+          <div class="detail-stat"><small>Workers</small><strong>${t.total || 0}</strong></div>
+        </div>
+        <h2 style="margin-top:0">Worker Breakdown</h2>
+        <div class="panel">
+          <table>
+            <thead><tr><th>Worker</th><th>Status</th><th>OK</th><th>Fail</th><th>Details</th></tr></thead>
+            <tbody>
+              ${d.children && d.children.length ? d.children.map(c => `
+                <tr>
+                  <td><span class="pill">worker.${c.worker}</span></td>
+                  <td><span class="pill ${c.status === 'done' ? 'ok' : c.status === 'failed' ? 'bad' : c.status === 'partial' ? 'partial' : 'running'}">${esc(c.status.toUpperCase())}</span></td>
+                  <td class="green">${c.ok || 0}</td>
+                  <td class="red">${c.fail || 0}</td>
+                  <td class="detail-error">${esc(c.error || (c.finished_at ? 'Completed' : 'Waiting'))}</td>
+                </tr>
+              `).join('') : '<tr><td colspan="5" style="text-align:center;color:var(--muted)">No child worker records yet</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+        <h2>Task Parameters</h2>
+        <code class="detail-code">${esc(parameterText)}</code>
+      </div>
+    </div>
+  `;
+}
+
 async function activity() {
-  let d = await get('/api/activity');
+  let d = await get('/api/activity?limit=100');
   if (!d) return;
+  const actions = [...new Set(d.rows.map(x => x.action).filter(Boolean))].sort();
+  const actionOptions = actions.map(x => `<option value="${esc(x)}">${esc(x)}</option>`).join('');
 
   app.innerHTML = `
     <div class="page-header">
-      <h1>System Activity Logs</h1>
-      <span class="pill">Last 100 entries</span>
+      <div>
+        <h1>Activity</h1>
+        <div style="color:var(--muted);margin-top:4px;">Recent tasks — click any row for the full breakdown, reasons and failed accounts.</div>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;">
+        <span class="pill running">LIVE</span>
+        <button class="btn secondary icon" onclick="activity()" title="Refresh">↻</button>
+      </div>
+    </div>
+    <div class="filter-bar">
+      <input id="activity-search" placeholder="Search action, target or task ID..." oninput="activityFilter()">
+      <select id="activity-action" onchange="activityFilter()">
+        <option value="all">All actions</option>${actionOptions}
+      </select>
+      <select id="activity-status" onchange="activityFilter()">
+        <option value="all">All statuses</option>
+        <option value="running">Running</option>
+        <option value="queued">Queued</option>
+        <option value="done">Done</option>
+        <option value="partial">Partial</option>
+        <option value="failed">Failed</option>
+      </select>
     </div>
     <div class="panel">
       <table>
         <thead>
           <tr>
-            <th>Timestamp</th>
-            <th>Account / Worker</th>
-            <th>Action Performed</th>
+            <th>When</th>
+            <th>Action</th>
             <th>Target</th>
+            <th>By</th>
+            <th>Progress</th>
+            <th>OK</th>
+            <th>Fail</th>
             <th>Status</th>
           </tr>
         </thead>
         <tbody>
-          ${d.rows.length ? d.rows.map(x => `
-            <tr>
-              <td>${esc(x.time)}</td>
-              <td><strong>${esc(x.account || 'System')}</strong></td>
-              <td>${esc(x.action)}</td>
-              <td>${esc(x.target || '-')}</td>
-              <td><span class="pill ${x.status === 'success' || x.status === 'ok' ? 'ok' : x.status === 'failed' ? 'bad' : ''}">${esc(x.status)}</span></td>
-            </tr>
-          `).join('') : '<tr><td colspan="5" style="text-align:center;color:var(--muted)">No activity logged yet</td></tr>'}
+          ${d.rows.length ? d.rows.map(x => {
+            const search = esc(`${x.id} ${x.action} ${x.target} ${x.by}`.toLowerCase());
+            const statusClass = x.status === 'done' ? 'ok' : x.status === 'failed' ? 'bad' : x.status === 'partial' ? 'partial' : 'running';
+            return `
+              <tr class="activity-row" data-search="${search}" data-action="${esc(x.action)}" data-status="${esc(x.status)}" onclick="openTask('${esc(x.id)}')">
+                <td>${esc(x.when)}</td>
+                <td><strong>${esc(x.action)}</strong></td>
+                <td><span class="activity-target" title="${esc(x.target)}">${esc(x.target || '-')}</span></td>
+                <td><span class="pill">${esc(x.by || 'auto')}</span></td>
+                <td>${progressHtml(x.progress)}</td>
+                <td class="green">${x.ok || 0}</td>
+                <td class="red">${x.fail || 0}</td>
+                <td><span class="pill ${statusClass}">${esc((x.status || 'queued').toUpperCase())}</span></td>
+              </tr>
+            `;
+          }).join('') : '<tr><td colspan="8" style="text-align:center;color:var(--muted);padding:30px">No dashboard tasks yet</td></tr>'}
         </tbody>
       </table>
     </div>
   `;
+  const search = document.getElementById('activity-search');
+  const action = document.getElementById('activity-action');
+  const status = document.getElementById('activity-status');
+  if (search) search.value = activityFilters.search;
+  if (action) action.value = activityFilters.action;
+  if (status) status.value = activityFilters.status;
+  activityFilter();
+  if (!timer) timer = setInterval(activity, 5000);
 }
 
 // Initial View
@@ -925,6 +1219,111 @@ def worker_slots():
     return sorted(set(int(d.get("slot", 0) or 0) for d in docs)) or [0]
 
 
+def _relative_time(value):
+    """Human-friendly age used by the activity feed."""
+    if not hasattr(value, "total_seconds"):
+        return "-"
+    seconds = max(0, int((now() - value).total_seconds()))
+    if seconds < 5:
+        return "just now"
+    if seconds < 60:
+        return f"{seconds}s ago"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h ago"
+    return f"{hours // 24}d ago"
+
+
+def _task_target(parent):
+    params = parent.get("params") or {}
+    value = (params.get("target") or params.get("link") or
+             params.get("channel_link") or params.get("file_name") or "-")
+    if isinstance(value, (dict, list)):
+        value = str(value)
+    return str(value)
+
+
+def _task_by(parent):
+    params = parent.get("params") or {}
+    value = params.get("by") or params.get("source")
+    if value:
+        return str(value).lower()
+    # Internal worker fan-outs are created by the bot and have no dashboard
+    # marker. Web-created tasks are explicitly tagged as dashboard tasks in
+    # queue_fanout() and the upload endpoints.
+    return "auto"
+
+
+def _task_snapshot(parent, children):
+    """Convert a parent task and its children into the activity-row shape."""
+    terminal = {"done", "failed", "partial", "cancelled"}
+    completed = sum(1 for child in children if child.get("status") in terminal)
+    total = len(children)
+    results = [child.get("result") or {} for child in children]
+    ok = sum(int(result.get("ok", 0) or 0) for result in results)
+    failed = sum(int(result.get("failed", 0) or 0) for result in results)
+    failed += sum(1 for result in results
+                  if result.get("error") and not result.get("failed"))
+
+    if not children:
+        status = str(parent.get("status") or "queued").lower()
+        progress = 0
+    elif completed < total:
+        status = "running" if any(
+            child.get("status") == "running" for child in children
+        ) else "queued"
+        progress = int(completed / total * 100)
+    else:
+        status = "failed" if all(
+            child.get("status") == "failed" for child in children
+        ) else ("partial" if any(
+            child.get("status") in {"failed", "partial"} for child in children
+        ) else "done")
+        progress = 100
+
+    created = parent.get("created_at")
+    return {
+        "id": str(parent.get("_id")),
+        "when": _relative_time(created),
+        "created_at": created.isoformat() if hasattr(created, "isoformat") else "",
+        "action": str(parent.get("action") or "task").lower(),
+        "target": _task_target(parent),
+        "by": _task_by(parent),
+        "progress": progress,
+        "completed": completed,
+        "total": total,
+        "ok": ok,
+        "fail": failed,
+        "status": status,
+    }
+
+
+def _activity_tasks(limit=50, action="", status=""):
+    """Read recent dashboard task parents with one child query."""
+    limit = max(1, min(int(limit or 50), 100))
+    query = {"kind": "parent"}
+    if action and action != "all":
+        query["action"] = action
+    parents = list(db["dashboard_tasks"].find(query)
+                   .sort("created_at", -1).limit(limit))
+    parent_ids = [parent["_id"] for parent in parents]
+    children_by_parent = {parent_id: [] for parent_id in parent_ids}
+    if parent_ids:
+        for child in db["dashboard_tasks"].find(
+            {"kind": "child", "parent_id": {"$in": parent_ids}},
+            {"parent_id": 1, "status": 1, "result": 1},
+        ):
+            children_by_parent.setdefault(child.get("parent_id"), []).append(child)
+    rows = [_task_snapshot(parent, children_by_parent.get(parent["_id"], []))
+            for parent in parents]
+    if status and status != "all":
+        rows = [row for row in rows if row["status"] == status]
+    return rows
+
+
 @app.get("/api/summary")
 def api_summary():
     if (err := guard()): return err
@@ -940,21 +1339,7 @@ def api_summary():
     live_rows = list(db["live_state"].find({}))
     voice_accounts = sum(len(row.get("keys", [])) for row in live_rows)
     voice_memberships = sum(int(row.get("target", 0) or 0) for row in live_rows)
-    tasks = []
-    for parent in db["dashboard_tasks"].find({"kind": "parent"}).sort("created_at", -1).limit(12):
-        children = list(db["dashboard_tasks"].find({"parent_id": parent["_id"]}))
-        done = sum(1 for c in children if c.get("status") in {"done", "failed", "partial"})
-        ok = sum(int(c.get("result", {}).get("ok", 0) or 0) for c in children)
-        fail = sum(int(c.get("result", {}).get("failed", 0) or 0) for c in children)
-        tasks.append({
-            "when": parent.get("created_at", now()).strftime("%d %b %H:%M"),
-            "action": parent.get("action"),
-            "target": (parent.get("params") or {}).get("target", ""),
-            "progress": int(done / len(children) * 100) if children else 0,
-            "ok": ok,
-            "fail": fail,
-            "status": "running" if done < len(children) else ("failed" if any(c.get("status") == "failed" for c in children) else "done")
-        })
+    tasks = _activity_tasks(limit=12)
     data = {
         "total": total,
         "leased": leased,
@@ -1013,29 +1398,73 @@ def api_plans():
 @app.get("/api/activity")
 def api_activity():
     if (err := guard()): return err
-    rows = []
-    for d in db["history"].find({}).sort("timestamp", -1).limit(100):
-        rows.append({
-            "time": d.get("timestamp", now()).strftime("%d %b %H:%M") if hasattr(d.get("timestamp"), "strftime") else "-",
-            "account": d.get("phone", ""),
-            "action": d.get("action", ""),
-            "target": d.get("target", ""),
-            "status": d.get("status", "")
+    try:
+        limit = max(1, min(int(request.args.get("limit", 50)), 100))
+    except (TypeError, ValueError):
+        limit = 50
+    rows = _activity_tasks(
+        limit=limit,
+        action=str(request.args.get("action", "")).strip().lower(),
+        status=str(request.args.get("status", "")).strip().lower(),
+    )
+    return jsonify({"rows": rows, "updated_at": now().isoformat()})
+
+
+@app.get("/api/activity/<task_id>")
+def api_activity_detail(task_id):
+    if (err := guard()): return err
+    try:
+        parent_id = ObjectId(task_id)
+    except Exception:
+        return jsonify({"error": "invalid task id"}), 400
+    parent = db["dashboard_tasks"].find_one({
+        "_id": parent_id, "kind": "parent"
+    })
+    if not parent:
+        return jsonify({"error": "task not found"}), 404
+    children = []
+    for child in db["dashboard_tasks"].find(
+        {"parent_id": parent_id, "kind": "child"}
+    ).sort("created_at", 1):
+        result = child.get("result") or {}
+        started = child.get("started_at")
+        finished = child.get("finished_at")
+        children.append({
+            "id": str(child.get("_id")),
+            "worker": int(child.get("worker_slot", 0) or 0) + 1,
+            "status": str(child.get("status") or "queued").lower(),
+            "ok": int(result.get("ok", 0) or 0),
+            "fail": int(result.get("failed", 0) or 0),
+            "error": str(result.get("error") or ""),
+            "started_at": started.isoformat() if hasattr(started, "isoformat") else "",
+            "finished_at": finished.isoformat() if hasattr(finished, "isoformat") else "",
         })
-    return jsonify({"rows": rows})
+    row = _task_snapshot(parent, [{
+        "status": child["status"],
+        "result": {"ok": child["ok"], "failed": child["fail"],
+                   "error": child["error"]},
+    } for child in children])
+    return jsonify({
+        "task": row,
+        "params": parent.get("params") or {},
+        "children": children,
+    })
 
 
 def queue_fanout(action, params):
     parent_id = ObjectId()
     slots = worker_slots()
+    params = dict(params or {})
+    params.setdefault("by", "dashboard")
+    created = now()
     db["dashboard_tasks"].insert_one({
         "_id": parent_id, "kind": "parent", "action": action,
-        "params": params, "status": "queued", "created_at": now(),
+        "params": params, "status": "queued", "created_at": created,
     })
     children = [{
         "_id": ObjectId(), "kind": "child", "parent_id": parent_id,
         "action": action, "params": params, "worker_slot": slot,
-        "status": "queued", "created_at": now(),
+        "status": "queued", "created_at": created,
     } for slot in slots]
     if children:
         db["dashboard_tasks"].insert_many(children)
@@ -1147,11 +1576,11 @@ def api_session_import():
     parent_id = ObjectId()
     db["dashboard_tasks"].insert_one({
         "_id": parent_id, "kind": "parent", "action": "session_import",
-        "params": {"file_name": name}, "status": "queued", "created_at": now()
+        "params": {"file_name": name, "by": "dashboard"}, "status": "queued", "created_at": now()
     })
     db["dashboard_tasks"].insert_one({
         "_id": ObjectId(), "kind": "child", "parent_id": parent_id,
-        "action": "session_import", "params": {"file_name": name},
+        "action": "session_import", "params": {"file_name": name, "by": "dashboard"},
         "worker_slot": 0, "status": "queued", "created_at": now()
     })
     return jsonify({"id": str(parent_id), "workers": 1})
@@ -1176,11 +1605,11 @@ def api_profile_photo():
     slots = worker_slots()
     db["dashboard_tasks"].insert_one({
         "_id": parent_id, "kind": "parent", "action": "profile_photo",
-        "params": {"file_name": name}, "status": "queued", "created_at": now()
+        "params": {"file_name": name, "by": "dashboard"}, "status": "queued", "created_at": now()
     })
     db["dashboard_tasks"].insert_many([{
         "_id": ObjectId(), "kind": "child", "parent_id": parent_id,
-        "action": "profile_photo", "params": {"file_name": name},
+        "action": "profile_photo", "params": {"file_name": name, "by": "dashboard"},
         "worker_slot": slot, "status": "queued", "created_at": now()
     } for slot in slots])
     return jsonify({"id": str(parent_id), "workers": len(slots)})

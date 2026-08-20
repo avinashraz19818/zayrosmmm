@@ -351,6 +351,10 @@ WORKER_SESSION_NAMES: Optional[set] = None
 ACCOUNT_SLOT_BY_KEY: Dict[str, int] = {}
 ACCOUNT_REMOTE_BY_KEY: Dict[str, str] = {}
 _SHARD_RECONCILE_RUNNING = False
+# The home screen is opened frequently. Keep the small global shard summary for
+# a few seconds instead of issuing four MongoDB round trips for every tap.
+_GLOBAL_ACCOUNT_TOTALS_CACHE: Optional[Tuple[float, Tuple[int, int, int, int]]] = None
+GLOBAL_ACCOUNT_TOTALS_CACHE_SECONDS = 5.0
 
 
 # ═══════════════════════ TEXT STYLING ═══════════════════════
@@ -1079,12 +1083,17 @@ async def ensure_database_indexes():
     await col_approved.create_index("user_id")
     await col_storage.create_index("gridfs_id")
     await col_account_shards.create_index([("slot", 1), ("owner", 1)])
-    await col_dashboard_tasks.create_index([("status", 1), ("worker_slot", 1), ("created_at", 1)])
+    await col_account_shards.create_index("account_key")
+    await col_dashboard_tasks.create_index([
+        ("kind", 1), ("worker_slot", 1), ("status", 1), ("created_at", 1)
+    ])
     await col_dashboard_tasks.create_index("parent_id")
     await col_dashboard_tokens.create_index("expires_at", expireAfterSeconds=0)
 
 
 _LAST_HEROKU_WORKER_TARGET: Optional[int] = None
+_LAST_HEROKU_WORKER_CHECK = 0.0
+HEROKU_FORMATION_RECHECK_SECONDS = 300.0
 
 
 def sharding_runtime_enabled() -> bool:
@@ -1096,15 +1105,20 @@ async def heroku_scale_workers(quantity: int):
     """Ask the Heroku Formation API for the required worker count.
 
     The API key is optional. Without it the app remains safe and logs the
-    manual scale command instead of failing startup.
+    manual scale command instead of failing startup. Formation drift is checked
+    periodically, not on every 60-second shard tick, so an idle bot does not
+    spend a network request on the Heroku control plane every minute.
     """
-    global _LAST_HEROKU_WORKER_TARGET
+    global _LAST_HEROKU_WORKER_TARGET, _LAST_HEROKU_WORKER_CHECK
     quantity = max(1, int(quantity))
     if not IS_CONTROLLER_WORKER:
         return
-    # Re-check formation on every reconciliation: an operator may have
-    # manually scaled to 20 while the desired shard count is 17. The controller
-    # must correct that drift instead of trusting an in-process cache.
+    now_mono = time.monotonic()
+    if (_LAST_HEROKU_WORKER_TARGET == quantity
+            and now_mono - _LAST_HEROKU_WORKER_CHECK < HEROKU_FORMATION_RECHECK_SECONDS):
+        return
+    # A changed session count is applied immediately. If an operator manually
+    # changes formation, the same target is corrected on the five-minute check.
     if not HEROKU_APP_NAME or not HEROKU_API_KEY:
         logger.warning(
             "Account sharding needs %s worker(s). Set HEROKU_APP_NAME and "
@@ -1113,6 +1127,7 @@ async def heroku_scale_workers(quantity: int):
             quantity, quantity,
         )
         _LAST_HEROKU_WORKER_TARGET = quantity
+        _LAST_HEROKU_WORKER_CHECK = now_mono
         return
 
     def patch_formation():
@@ -1134,9 +1149,11 @@ async def heroku_scale_workers(quantity: int):
     try:
         status = await asyncio.to_thread(patch_formation)
         _LAST_HEROKU_WORKER_TARGET = quantity
+        _LAST_HEROKU_WORKER_CHECK = time.monotonic()
         logger.info("Heroku formation requested: worker=%s (HTTP %s)",
                     quantity, status)
     except Exception as exc:
+        _LAST_HEROKU_WORKER_CHECK = time.monotonic()
         logger.error("Heroku auto-scale to worker=%s failed: %s", quantity, exc)
 
 
@@ -1158,71 +1175,8 @@ async def _infer_account_key(session_name: str) -> str:
     return stem
 
 
-async def reconcile_account_shards() -> set:
-    """Assign every remote session to one worker slot and claim this slot's files."""
-    global WORKER_SESSION_NAMES, ACCOUNT_SLOT_BY_KEY, ACCOUNT_REMOTE_BY_KEY
-    if not sharding_runtime_enabled() or col_storage is None or col_account_shards is None:
-        WORKER_SESSION_NAMES = None
-        return set()
-
-    session_docs = await col_storage.find(
-        {"_id": {"$regex": r"^sessions/.*\.session$"}},
-        {"_id": 1},
-    ).sort("_id", 1).to_list(length=None)
-    names = [doc["_id"] for doc in session_docs]
-    desired_workers = max(1, ceil(len(names) / ACCOUNT_SHARD_SIZE))
-    await heroku_scale_workers(desired_workers)
-
-    existing_docs = await col_account_shards.find(
-        {"_id": {"$in": names}}
-    ).to_list(length=None) if names else []
-    existing = {doc["_id"]: doc for doc in existing_docs}
-
-    # Sidecar reads are small; do them in bounded parallelism.
-    sem = asyncio.Semaphore(20)
-
-    async def key_for(name):
-        async with sem:
-            return name, await _infer_account_key(name)
-
-    key_pairs = await asyncio.gather(*(key_for(name) for name in names))
-    key_by_name = dict(key_pairs)
-    counts = [0] * desired_workers
-    assignments = {}
-
-    for name in names:
-        old = existing.get(name, {})
-        try:
-            old_slot = int(old.get("slot"))
-        except (TypeError, ValueError):
-            old_slot = -1
-        if 0 <= old_slot < desired_workers and counts[old_slot] < ACCOUNT_SHARD_SIZE:
-            slot = old_slot
-        else:
-            available = [i for i, count in enumerate(counts)
-                         if count < ACCOUNT_SHARD_SIZE]
-            slot = min(available, key=lambda i: counts[i]) if available else desired_workers - 1
-        counts[slot] += 1
-        assignments[name] = slot
-
-    now = utcnow()
-    writes = []
-    for name, slot in assignments.items():
-        old = existing.get(name, {})
-        fields = {
-            "slot": slot,
-            "account_key": key_by_name[name],
-            "updated_at": now,
-        }
-        if old.get("slot") != slot:
-            # If an old worker owns this file, give it a short handoff window to
-            # release the SQLite connection before the new slot claims it.
-            fields["handoff_until"] = now + datetime.timedelta(seconds=30)
-        writes.append(UpdateOne({"_id": name}, {"$set": fields}, upsert=True))
-    if writes:
-        await col_account_shards.bulk_write(writes, ordered=False)
-
-    assigned = {name for name, slot in assignments.items() if slot == WORKER_SLOT}
+async def _claim_worker_shards(assigned: set, now: datetime.datetime) -> set:
+    """Claim this dyno's assigned sessions without opening their SQLite files."""
     await col_account_shards.update_many(
         {"owner": WORKER_INSTANCE_ID,
          "_id": {"$nin": list(assigned)} if assigned else {"$exists": True}},
@@ -1231,20 +1185,21 @@ async def reconcile_account_shards() -> set:
 
     claimed = set()
     for name in assigned:
+        # The update is deliberately conditional: an old dyno may still own a
+        # file during a rolling replacement, and the handoff window prevents two
+        # Telethon processes from opening the same SQLite inode.
         query = {
             "_id": name,
             "slot": WORKER_SLOT,
-            "$and": [
-                {"$or": [
-                    {"owner": {"$exists": False}},
-                    {"owner": None},
-                    {"owner": WORKER_INSTANCE_ID},
-                    {"$and": [
-                        {"lease_until": {"$lt": now}},
-                        {"$or": [
-                            {"handoff_until": {"$exists": False}},
-                            {"handoff_until": {"$lte": now}},
-                        ]},
+            "$or": [
+                {"owner": {"$exists": False}},
+                {"owner": None},
+                {"owner": WORKER_INSTANCE_ID},
+                {"$and": [
+                    {"lease_until": {"$lt": now}},
+                    {"$or": [
+                        {"handoff_until": {"$exists": False}},
+                        {"handoff_until": {"$lte": now}},
                     ]},
                 ]},
             ],
@@ -1256,18 +1211,165 @@ async def reconcile_account_shards() -> set:
         )
         if result.matched_count:
             claimed.add(name)
-
-    ACCOUNT_SLOT_BY_KEY = {
-        key_by_name[name]: assignments[name]
-        for name in names if name in assignments
-    }
-    ACCOUNT_REMOTE_BY_KEY = {
-        key_by_name[name]: name for name in names if name in assignments
-    }
-    WORKER_SESSION_NAMES = claimed
-    logger.info("Worker %s owns %s/%s session shard(s); formation target=%s",
-                WORKER_INSTANCE_ID, len(claimed), len(names), desired_workers)
     return claimed
+
+
+async def reconcile_account_shards() -> set:
+    """Keep the shard map current while avoiding a GridFS scan on every worker.
+
+    Only the controller recalculates assignments. Other workers already know
+    their slot from ``account_shards`` and only refresh their lease. The old
+    implementation made every worker download every account's JSON sidecar on
+    every reconcile tick; with a large fleet that saturated MongoDB and delayed
+    Telegram updates by the database server-selection timeout.
+    """
+    global WORKER_SESSION_NAMES, ACCOUNT_SLOT_BY_KEY, ACCOUNT_REMOTE_BY_KEY
+    global _SHARD_RECONCILE_RUNNING
+    if not sharding_runtime_enabled() or col_account_shards is None:
+        WORKER_SESSION_NAMES = None
+        return set()
+    if _SHARD_RECONCILE_RUNNING:
+        return set(WORKER_SESSION_NAMES or set())
+
+    _SHARD_RECONCILE_RUNNING = True
+    try:
+        now = utcnow()
+
+        if not IS_CONTROLLER_WORKER:
+            # A non-controller never needs GridFS sidecars or the complete
+            # storage manifest. The lightweight shard map is enough to build
+            # global account ordering and claim this worker's ten sessions.
+            shard_docs = await col_account_shards.find(
+                {}, {"_id": 1, "account_key": 1, "slot": 1}
+            ).to_list(length=None)
+            slot_by_name = {}
+            key_by_name = {}
+            for doc in shard_docs:
+                name = doc.get("_id")
+                if not name:
+                    continue
+                try:
+                    slot = int(doc.get("slot", -1))
+                except (TypeError, ValueError):
+                    slot = -1
+                slot_by_name[name] = slot
+                key = str(doc.get("account_key") or "").strip()
+                if key:
+                    key_by_name[name] = key
+
+            assigned = {name for name, slot in slot_by_name.items()
+                        if slot == WORKER_SLOT}
+            claimed = await _claim_worker_shards(assigned, now)
+            ACCOUNT_SLOT_BY_KEY = {
+                key_by_name[name]: slot_by_name[name]
+                for name in key_by_name
+                if name in slot_by_name and slot_by_name[name] >= 0
+            }
+            ACCOUNT_REMOTE_BY_KEY = {
+                key_by_name[name]: name for name in key_by_name
+                if name in slot_by_name and slot_by_name[name] >= 0
+            }
+            WORKER_SESSION_NAMES = claimed
+            desired_workers = max(
+                1,
+                max(slot_by_name.values(), default=-1) + 1,
+                ceil(len(slot_by_name) / ACCOUNT_SHARD_SIZE),
+            )
+            logger.info("Worker %s owns %s/%s session shard(s); formation target=%s",
+                        WORKER_INSTANCE_ID, len(claimed), len(slot_by_name),
+                        desired_workers)
+            return claimed
+
+        if col_storage is None:
+            WORKER_SESSION_NAMES = set()
+            return set()
+
+        # Controller-only assignment pass. This is one manifest query plus one
+        # small shard-map query; GridFS is touched only for new shard rows that
+        # do not yet have an account_key.
+        session_docs = await col_storage.find(
+            {"_id": {"$regex": r"^sessions/.*\.session$"}},
+            {"_id": 1},
+        ).sort("_id", 1).to_list(length=None)
+        names = [doc["_id"] for doc in session_docs]
+        desired_workers = max(1, ceil(len(names) / ACCOUNT_SHARD_SIZE))
+        await heroku_scale_workers(desired_workers)
+
+        existing_docs = await col_account_shards.find(
+            {"_id": {"$in": names}},
+            {"_id": 1, "slot": 1, "account_key": 1, "owner": 1,
+             "lease_until": 1, "handoff_until": 1},
+        ).to_list(length=None) if names else []
+        existing = {doc["_id"]: doc for doc in existing_docs}
+
+        key_by_name = {
+            name: str(doc.get("account_key") or "").strip()
+            for name, doc in existing.items()
+            if str(doc.get("account_key") or "").strip()
+        }
+        missing_names = [name for name in names if name not in key_by_name]
+        if missing_names:
+            sem = asyncio.Semaphore(20)
+
+            async def key_for(name):
+                async with sem:
+                    return name, await _infer_account_key(name)
+
+            for name, key in await asyncio.gather(
+                *(key_for(name) for name in missing_names)
+            ):
+                key_by_name[name] = key
+
+        counts = [0] * desired_workers
+        assignments = {}
+        for name in names:
+            old = existing.get(name, {})
+            try:
+                old_slot = int(old.get("slot"))
+            except (TypeError, ValueError):
+                old_slot = -1
+            if (0 <= old_slot < desired_workers
+                    and counts[old_slot] < ACCOUNT_SHARD_SIZE):
+                slot = old_slot
+            else:
+                available = [i for i, count in enumerate(counts)
+                             if count < ACCOUNT_SHARD_SIZE]
+                slot = (min(available, key=lambda i: counts[i])
+                        if available else desired_workers - 1)
+            counts[slot] += 1
+            assignments[name] = slot
+
+        writes = []
+        for name, slot in assignments.items():
+            old = existing.get(name, {})
+            key = key_by_name[name]
+            if old.get("slot") == slot and str(old.get("account_key") or "") == key:
+                continue
+            fields = {"slot": slot, "account_key": key, "updated_at": now}
+            if old.get("slot") != slot:
+                # Give an old worker time to release its SQLite connection
+                # before another slot materialises the same session.
+                fields["handoff_until"] = now + datetime.timedelta(seconds=30)
+            writes.append(UpdateOne({"_id": name}, {"$set": fields}, upsert=True))
+        if writes:
+            await col_account_shards.bulk_write(writes, ordered=False)
+
+        assigned = {name for name, slot in assignments.items()
+                    if slot == WORKER_SLOT}
+        claimed = await _claim_worker_shards(assigned, now)
+        ACCOUNT_SLOT_BY_KEY = {
+            key_by_name[name]: assignments[name]
+            for name in names if name in assignments
+        }
+        ACCOUNT_REMOTE_BY_KEY = {
+            key_by_name[name]: name for name in names if name in assignments
+        }
+        WORKER_SESSION_NAMES = claimed
+        logger.info("Worker %s owns %s/%s session shard(s); formation target=%s",
+                    WORKER_INSTANCE_ID, len(claimed), len(names), desired_workers)
+        return claimed
+    finally:
+        _SHARD_RECONCILE_RUNNING = False
 
 
 async def prune_local_sessions_not_owned():
@@ -1737,8 +1839,11 @@ async def run_dashboard_child_task(task: dict) -> dict:
 
 async def dashboard_task_worker():
     """Consume one dashboard child task for this worker shard at a time."""
+    # A one-second empty poll on every dyno multiplied MongoDB traffic during
+    # normal idle time. Two seconds keeps dashboard actions responsive while
+    # leaving the connection pool for Telegram events and shard leases.
     while True:
-        await asyncio.sleep(1)
+        await asyncio.sleep(2)
         if col_dashboard_tasks is None:
             continue
         child = None
@@ -4547,20 +4652,36 @@ async def expiry_check_task():
 
 async def global_account_totals() -> Optional[Tuple[int, int, int, int]]:
     """Return (total sessions, leased accounts, shard count, live workers)."""
+    global _GLOBAL_ACCOUNT_TOTALS_CACHE
     if not sharding_runtime_enabled() or col_account_shards is None:
         return None
+
+    cached = _GLOBAL_ACCOUNT_TOTALS_CACHE
+    if cached and time.monotonic() - cached[0] < GLOBAL_ACCOUNT_TOTALS_CACHE_SECONDS:
+        return cached[1]
+
+    # One projected read is cheaper than the old count + count + distinct +
+    # find sequence, and it gives a consistent snapshot for the menu text.
     now = utcnow()
-    total = await col_account_shards.count_documents({})
-    leased_accounts = await col_account_shards.count_documents({
-        "lease_until": {"$gt": now}
-    })
-    owners = await col_account_shards.distinct("owner", {
-        "lease_until": {"$gt": now},
-        "owner": {"$nin": [None, ""]},
-    })
-    docs = await col_account_shards.find({}, {"slot": 1}).to_list(length=None)
-    workers = max((int(d.get("slot", 0) or 0) for d in docs), default=-1) + 1
-    return total, leased_accounts, workers, len(owners)
+    docs = await col_account_shards.find(
+        {}, {"slot": 1, "owner": 1, "lease_until": 1}
+    ).to_list(length=None)
+    leased_accounts = sum(
+        1 for doc in docs
+        if doc.get("lease_until") and doc["lease_until"] > now
+    )
+    owners = {
+        doc.get("owner") for doc in docs
+        if doc.get("owner") and doc.get("lease_until")
+        and doc["lease_until"] > now
+    }
+    workers = max(
+        (int(doc.get("slot", 0) or 0) for doc in docs),
+        default=-1,
+    ) + 1
+    result = (len(docs), leased_accounts, workers, len(owners))
+    _GLOBAL_ACCOUNT_TOTALS_CACHE = (time.monotonic(), result)
+    return result
 
 
 async def available_account_count() -> int:
@@ -4595,7 +4716,30 @@ async def safe_edit(event, text, buttons=None):
 async def show_menu(event, user_id, edit=True):
     online = acc_count()
     account_line = f"{E_PERSON} {S('Accounts online')}: <b>{online}</b>"
-    global_totals = await global_account_totals()
+
+    async def client_counts():
+        try:
+            total = await col_clients.count_documents({})
+            active = await col_clients.count_documents({"status": "active"})
+            return total, active
+        except Exception:
+            return 0, 0
+
+    # These values are independent. Running them together prevents a slow Atlas
+    # round trip for one counter from delaying every other part of the menu.
+    global_totals, joins, client_total_pair = await asyncio.gather(
+        global_account_totals(), get_today_joins(), client_counts(),
+        return_exceptions=True,
+    )
+    if isinstance(global_totals, Exception):
+        logger.debug("global account totals unavailable: %s", global_totals)
+        global_totals = None
+    if isinstance(joins, Exception):
+        joins = 0
+    if isinstance(client_total_pair, Exception):
+        client_total_pair = (0, 0)
+    total_clients, active_subs = client_total_pair
+
     if global_totals is not None:
         total, leased_accounts, workers, live_workers = global_totals
         online = total
@@ -4603,12 +4747,6 @@ async def show_menu(event, user_id, edit=True):
                         f"<i>({leased_accounts} {S('accounts leased')}, "
                         f"{live_workers}/{workers} {S('workers online')})</i>")
     problems = len(PROBLEM_SESSIONS)
-    joins = await get_today_joins()
-    try:
-        total_clients = await col_clients.count_documents({})
-        active_subs = await col_clients.count_documents({"status": "active"})
-    except Exception:
-        total_clients = active_subs = 0
 
     is_owner = user_id in OWNER_IDS
     text = card(E_ROCKET, "Reaction & Views Panel", [
@@ -5312,6 +5450,7 @@ async def on_callback(event):
 
     data = event.data.decode()
     owner = uid in OWNER_IDS
+    started = time.monotonic()
     logger.info(f"cb {uid}: {data}")
 
     try:
@@ -5324,6 +5463,10 @@ async def on_callback(event):
             await event.answer(f"Error: {str(e)[:150]}", alert=True)
         except Exception:
             pass
+    finally:
+        elapsed = time.monotonic() - started
+        if elapsed >= 2:
+            logger.warning("callback %s took %.1fs", data, elapsed)
 
 
 OWNER_ONLY = {

@@ -950,8 +950,13 @@ def worker_owns_runtime_object(name: str) -> bool:
     return True
 
 
-async def restore_runtime_storage():
-    """Restore all remote runtime objects into the ephemeral working tree."""
+async def restore_runtime_storage(force: bool = True):
+    """Restore runtime objects into the working tree.
+
+    Startup uses ``force=True`` because the tree is empty. Reconciliation must
+    use ``force=False``: replacing an open Telethon SQLite file creates the
+    readonly/unlinked-inode errors seen when a worker reshards live accounts.
+    """
     if col_storage is None:
         return
     docs = []
@@ -974,7 +979,7 @@ async def restore_runtime_storage():
             target = os.path.join(RUNTIME_ROOT, name[len("bot/"):])
         else:
             return
-        await storage_download_path(name, target)
+        await storage_download_path(name, target, force=force)
 
     sem = asyncio.Semaphore(6)
 
@@ -1289,13 +1294,14 @@ async def worker_shard_reconcile_task():
             before = set(WORKER_SESSION_NAMES or set())
             after = await reconcile_account_shards()
             if after != before:
-                await restore_runtime_storage()
+                await restore_runtime_storage(force=False)
                 # Disconnect sessions that moved away from this slot.
                 allowed_stems = {os.path.splitext(os.path.basename(n))[0] for n in after}
                 for key, account in list(ACCOUNTS.items()):
                     if account.stem not in allowed_stems:
                         await disconnect_account(key)
                         ACCOUNTS.pop(key, None)
+                await prune_local_sessions_not_owned()
                 # Probe only newly claimed local files, not all ten on every tick.
                 loaded_stems = {a.stem for a in ACCOUNTS.values()}
                 for name in after:
@@ -1572,7 +1578,7 @@ async def _dashboard_session_import_local(params: dict) -> dict:
                 logger.warning("dashboard ZIP session %s: %s", source, exc)
         if sharding_runtime_enabled():
             await reconcile_account_shards()
-            await restore_runtime_storage()
+            await restore_runtime_storage(force=False)
             await prune_local_sessions_not_owned()
             # Worker.1 is the controller and may own the first shard. Load its
             # newly assigned files immediately instead of waiting for the next
@@ -7585,7 +7591,7 @@ async def handle_zip_import(event):
 
         if sharding_runtime_enabled():
             await reconcile_account_shards()
-            await restore_runtime_storage()
+            await restore_runtime_storage(force=False)
             await prune_local_sessions_not_owned()
             await load_all_sessions()
 

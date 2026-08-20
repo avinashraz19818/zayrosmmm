@@ -778,41 +778,57 @@ async def storage_put_bytes(name: str, data: bytes, kind: str = "runtime") -> bo
 
 
 async def storage_get_bytes(name: str) -> Optional[bytes]:
-    manifest = await _storage_manifest(name)
-    if not manifest or storage_bucket is None:
+    if storage_bucket is None:
         return None
-    output = io.BytesIO()
-    try:
-        await storage_bucket.download_to_stream(manifest["gridfs_id"], output)
-        return output.getvalue()
-    except Exception as exc:
-        logger.warning("GridFS download failed for %s: %s", name, exc)
-        return None
+    last_error = None
+    for attempt in range(3):
+        manifest = await _storage_manifest(name)
+        if not manifest:
+            return None
+        output = io.BytesIO()
+        try:
+            await storage_bucket.download_to_stream(manifest["gridfs_id"], output)
+            return output.getvalue()
+        except Exception as exc:
+            last_error = exc
+            if attempt < 2:
+                await asyncio.sleep(0.5 * (attempt + 1))
+    logger.warning("GridFS download failed for %s: %s", name, last_error)
+    return None
 
 
 async def storage_download_path(name: str, path: str, force: bool = True) -> bool:
     """Materialise a GridFS object into a local working path atomically."""
-    manifest = await _storage_manifest(name)
-    if not manifest or storage_bucket is None:
+    if storage_bucket is None:
         return False
     if not force and os.path.exists(path):
         return True
     os.makedirs(os.path.dirname(path), exist_ok=True)
     partial = path + ".part"
-    try:
-        with open(partial, "wb") as destination:
-            await storage_bucket.download_to_stream(manifest["gridfs_id"], destination)
-        os.replace(partial, path)
-        stat = os.stat(path)
-        _LOCAL_UPLOAD_FINGERPRINTS[name] = (stat.st_size, stat.st_mtime_ns)
-        return True
-    except Exception as exc:
-        logger.warning("GridFS restore failed for %s: %s", name, exc)
+    last_error = None
+    for attempt in range(3):
+        manifest = await _storage_manifest(name)
+        if not manifest:
+            return False
         try:
-            os.unlink(partial)
-        except FileNotFoundError:
-            pass
-        return False
+            with open(partial, "wb") as destination:
+                await storage_bucket.download_to_stream(manifest["gridfs_id"], destination)
+            os.replace(partial, path)
+            stat = os.stat(path)
+            _LOCAL_UPLOAD_FINGERPRINTS[name] = (stat.st_size, stat.st_mtime_ns)
+            return True
+        except Exception as exc:
+            last_error = exc
+            try:
+                os.unlink(partial)
+            except FileNotFoundError:
+                pass
+            if attempt < 2:
+                # A concurrent GridFS manifest replacement can briefly expose
+                # the old file id; re-read the manifest before declaring loss.
+                await asyncio.sleep(0.5 * (attempt + 1))
+    logger.warning("GridFS restore failed for %s: %s", name, last_error)
+    return False
 
 
 async def storage_delete(name: str) -> bool:
@@ -7652,6 +7668,10 @@ async def main():
         print("  configuration: missing " + ", ".join(CONFIG_MISSING))
         print("  Set Heroku Config Vars; secrets are intentionally not in view.py.")
         return
+    if sharding_runtime_enabled() and WORKER_SLOT > 0:
+        # Stagger 24 dyno boots so a free Mongo cluster is not hit by every
+        # GridFS restore/Telethon connection in the same second.
+        await asyncio.sleep(min(30, WORKER_SLOT * 2))
     try:
         initialize_mongo_client()
         await mongo_client.admin.command("ping")

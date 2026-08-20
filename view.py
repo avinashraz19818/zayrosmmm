@@ -322,6 +322,9 @@ recent_messages: set = set()
 active_calls: dict = {}
 # account_key -> PyTgCalls instance (created lazily, one per account)
 TGCALLS: Dict[str, object] = {}
+# A stream_end callback is normally restarted for resilience. These markers
+# distinguish an owner-requested leave from an unexpected ffmpeg/network drop.
+INTENTIONAL_LIVE_STOPS: Dict[Tuple[str, int], float] = {}
 # channel_id -> set of account keys currently streaming audio there
 LIVE_AUDIO: Dict[int, set] = {}
 # channel_id -> {"pool": [keys usable for this call], "target": how many should
@@ -1523,6 +1526,30 @@ async def _dashboard_leave_local(params: dict) -> dict:
     return result
 
 
+async def _dashboard_leave_all_local(params: dict) -> dict:
+    """Leave every channel/group from only this worker's shard."""
+    result = {"ok": 0, "failed": 0}
+    keys = worker_task_keys()
+    for key in keys:
+        client = acc_client(key)
+        if not client:
+            continue
+        try:
+            async for dialog in client.iter_dialogs():
+                if not (dialog.is_channel or dialog.is_group):
+                    continue
+                try:
+                    await client.delete_dialog(dialog.entity)
+                    result["ok"] += 1
+                except Exception:
+                    result["failed"] += 1
+                await asyncio.sleep(0.3)
+        except Exception:
+            result["failed"] += 1
+    invalidate_peer_cache()
+    return result
+
+
 async def _dashboard_react_local(params: dict) -> dict:
     link = str(params.get("target", "")).strip()
     spec, message_id = parse_post_link(link)
@@ -1716,12 +1743,16 @@ async def _dashboard_manual_live_local(params: dict) -> dict:
     ltype, parsed = parse_target(target_link)
     if ltype not in ("public", "private"):
         return {"ok": 0, "failed": 1, "error": "invalid channel link"}
-    ordered = []
-    if col_account_shards is not None:
-        docs = await col_account_shards.find({}, {"account_key": 1, "slot": 1}).sort("slot", 1).to_list(length=None)
-        ordered = [str(d.get("account_key")) for d in docs if d.get("account_key")]
-    local_keys = [key for key in ordered[:requested]
-                  if local_worker_account(key) and acc_client(key)]
+    selected = [str(key) for key in (params.get("keys") or []) if str(key).strip()]
+    if selected:
+        # The controller/web picker sends explicit global IDs. Each worker
+        # keeps only the IDs it owns, so no worker opens another shard's file.
+        local_keys = [key for key in selected[:requested]
+                      if local_worker_account(key) and acc_client(key)]
+    else:
+        ordered = ordered_live_account_keys()
+        local_keys = [key for key in ordered[:requested]
+                      if local_worker_account(key) and acc_client(key)]
     if not local_keys:
         return {"ok": 0, "failed": 0, "error": "no selected accounts on this worker"}
     chat_id = None
@@ -1759,10 +1790,21 @@ async def _dashboard_live_local(params: dict):
     action = str(params.get("mode", "stop"))
     result = {"ok": 0, "failed": 0}
     if action == "stop":
+        requested_chat = params.get("chat_id")
+        try:
+            requested_chat = int(requested_chat) if requested_chat not in (None, "") else None
+        except (TypeError, ValueError):
+            requested_chat = None
         for chat_id, keys in list(LIVE_AUDIO.items()):
+            if requested_chat is not None and int(chat_id) != requested_chat:
+                continue
             for key in list(keys):
-                await stop_live_audio(key, chat_id)
-                result["ok"] += 1
+                try:
+                    await stop_live_audio(key, chat_id)
+                    result["ok"] += 1
+                except Exception as exc:
+                    result["failed"] += 1
+                    logger.warning("live stop %s/%s: %s", key, chat_id, exc)
             end_live_session(chat_id)
         return result
     if action == "rotate":
@@ -1816,6 +1858,8 @@ async def run_dashboard_child_task(task: dict) -> dict:
         return await _dashboard_join_local(params)
     if action == "leave":
         return await _dashboard_leave_local(params)
+    if action == "leave_all":
+        return await _dashboard_leave_all_local(params)
     if action == "react":
         return await _dashboard_react_local(params)
     if action == "views":
@@ -4015,6 +4059,65 @@ def free_live_keys(keys: List[str], chat_id: Optional[int] = None) -> List[str]:
     return out
 
 
+def ordered_live_account_keys() -> List[str]:
+    """Stable account-ID order used by both the bot picker and web panel."""
+    if sharding_runtime_enabled() and ACCOUNT_SLOT_BY_KEY:
+        return sorted(
+            ACCOUNT_SLOT_BY_KEY,
+            key=lambda key: (ACCOUNT_SLOT_BY_KEY.get(key, 10**9), str(key)),
+        )
+    return sorted(acc_keys())
+
+
+async def live_selection_candidates() -> List[str]:
+    """Return account IDs that are not already streaming in another call.
+
+    The controller knows every account ID from the shard map. The live-state
+    collection adds the accounts currently held by other workers, so the list
+    shown to the owner is global instead of incorrectly showing only the local
+    worker's ten sessions.
+    """
+    busy = {key for keys in LIVE_AUDIO.values() for key in keys}
+    if col_live_state is not None:
+        try:
+            async for row in col_live_state.find({}, {"keys": 1}):
+                busy.update(str(key) for key in (row.get("keys") or []))
+        except Exception as exc:
+            logger.debug("live selection state unavailable: %s", exc)
+
+    ordered = ordered_live_account_keys()
+    online = None
+    if sharding_runtime_enabled() and col_account_shards is not None:
+        try:
+            online = set()
+            async for row in col_account_shards.find(
+                {"account_key": {"$exists": True}},
+                {"account_key": 1, "lease_until": 1},
+            ):
+                lease = row.get("lease_until")
+                if lease and lease > utcnow():
+                    online.add(str(row.get("account_key")))
+        except Exception as exc:
+            logger.debug("live account lease state unavailable: %s", exc)
+
+    return [key for key in ordered
+            if (online is None or key in online)
+            and key not in busy and not is_frozen(key)]
+
+
+def live_account_id_lines(keys: List[str], limit: int = 20) -> List[str]:
+    """Render a compact account-ID preview without overflowing Telegram."""
+    lines = []
+    for index, key in enumerate(keys[:limit], 1):
+        slot = ACCOUNT_SLOT_BY_KEY.get(key)
+        worker = f" <i>worker.{slot + 1}</i>" if slot is not None else ""
+        lines.append(f"<b>{index}.</b> <code>{esc(str(key))}</code>{worker}")
+    if len(keys) > limit:
+        lines.append(f"<i>+ {len(keys) - limit} more account IDs. "
+                     f"The first requested IDs are selected in this order.</i>")
+    return lines
+
+
 async def get_tgcalls(key: str):
     """One PyTgCalls per account, created on first use and then reused."""
     if key in TGCALLS:
@@ -4028,8 +4131,17 @@ async def get_tgcalls(key: str):
     async def _restart(_c, update):
         # -stream_loop covers ~everything, but if the count ever runs out the
         # account would go silent and get dropped, so start the file again.
+        chat_id = getattr(update, "chat_id", None)
+        marker_key = (key, chat_id)
+        stopped_at = INTENTIONAL_LIVE_STOPS.get(marker_key)
+        if stopped_at is not None:
+            if time.monotonic() - stopped_at < 60:
+                # This stream ended because the owner pressed Leave/Stop. Do
+                # not immediately rejoin the same voice chat.
+                return
+            INTENTIONAL_LIVE_STOPS.pop(marker_key, None)
         try:
-            await call.play(update.chat_id, live_stream_source())
+            await call.play(chat_id, live_stream_source())
         except Exception as e:
             logger.debug(f"stream restart {key}: {e}")
 
@@ -4075,6 +4187,9 @@ async def play_live_audio(key: str, chat_id: int) -> Tuple[bool, str]:
         if spare < FD_HEADROOM:
             return False, f"only {spare} file descriptors left"
 
+    # A fresh owner-requested start cancels the previous leave marker for this
+    # account/chat pair, so a later natural stream-end can be restarted again.
+    INTENTIONAL_LIVE_STOPS.pop((key, chat_id), None)
     for attempt in range(2):
         try:
             call = await get_tgcalls(key)
@@ -4099,35 +4214,67 @@ async def play_live_audio(key: str, chat_id: int) -> Tuple[bool, str]:
     return False, "audio bridge failed"
 
 async def stop_live_audio(key: str, chat_id: int):
+    """Leave one account from one call and always clear durable bookkeeping.
+
+    ``call.calls`` can fail while Telegram is closing a voice chat. The old
+    code treated that lookup failure as the end of the cleanup path, so the
+    account stayed in the native call even though the local set was cleared.
+    If the active-call lookup is unavailable, call ``leave_call`` directly; the
+    native layer treats an already-ended call as harmless.
+    """
+    # Suppress the automatic stream_end recovery callback for this deliberate
+    # leave. Without this marker, ntgcalls sees the leave as a failed stream and
+    # immediately starts the MP3 again.
+    INTENTIONAL_LIVE_STOPS[(key, chat_id)] = time.monotonic()
     call = TGCALLS.get(key)
     if call is not None:
+        active = None
         try:
-            # The group call can disappear remotely before our keepalive sees
-            # it. Do not call native leave_call() for an already-removed call;
-            # ntgcalls prints "Call not found" and needlessly races cleanup.
             active = await call.calls
-            if chat_id in active:
+        except Exception as exc:
+            logger.debug("live call lookup failed for %s/%s: %s", key, chat_id, exc)
+
+        should_leave = active is None or chat_id in active
+        if should_leave:
+            try:
                 await call.leave_call(chat_id)
-        except Exception as e:
-            logger.debug(f"leave call {key}: {e}")
+            except Exception as exc:
+                # A call that disappeared between the lookup and leave is
+                # already gone. Do not block local/durable cleanup on it.
+                logger.debug("leave call %s/%s: %s", key, chat_id, exc)
+
     LIVE_AUDIO.get(chat_id, set()).discard(key)
     LIVE_SESSIONS.get(chat_id, {}).get("since", {}).pop(key, None)
     await persist_live_state(chat_id)
+
+
+def live_state_id(chat_id: int) -> str:
+    """Use one durable live-state row per worker in sharded mode."""
+    if sharding_runtime_enabled():
+        return f"{chat_id}:worker.{WORKER_SLOT}"
+    return str(chat_id)
 
 
 async def persist_live_state(chat_id: int):
     if col_live_state is None:
         return
     keys = list(LIVE_AUDIO.get(chat_id, set()))
+    document_id = live_state_id(chat_id)
     if not keys:
-        await col_live_state.delete_one({"_id": str(chat_id)})
+        await col_live_state.delete_one({"_id": document_id})
+        # Remove the pre-sharding single-row format once a worker has handled
+        # this call. Otherwise the old row can make the web panel show a ghost
+        # live stream and prevent an account from being selected again.
+        if sharding_runtime_enabled():
+            await col_live_state.delete_one({"_id": str(chat_id),
+                                             "worker_slot": {"$exists": False}})
         return
     sess = LIVE_SESSIONS.get(chat_id, {})
     await col_live_state.update_one(
-        {"_id": str(chat_id)},
-        {"$set": {"chat_id": chat_id, "keys": keys,
-                  "label": sess.get("label", ""), "target": sess.get("target", 0),
-                  "updated_at": utcnow()}},
+        {"_id": document_id},
+        {"$set": {"chat_id": chat_id, "worker_slot": WORKER_SLOT,
+                  "keys": keys, "label": sess.get("label", ""),
+                  "target": sess.get("target", 0), "updated_at": utcnow()}},
         upsert=True,
     )
 
@@ -5026,6 +5173,8 @@ async def show_live_now(event):
                          f"<b>{len(keys)}</b> {S('streaming')}"
                          + (f", {pool - len(keys)} {S('resting')}"
                             if pool > len(keys) else ""))
+            lines.append(f"{E_PERSON} <b>{S('Account IDs')}</b>")
+            lines += live_account_id_lines(sorted(keys), limit=20)
             buttons.append([btn(f"Stop {label[:14]}",
                                 f"live_stop_{chat_id}", icon="⏹"),
                             btn("Rotate", f"live_rotnow_{chat_id}", icon="🔄")])
@@ -6159,6 +6308,15 @@ async def route_callback(event, uid, owner, data):
              [btn("Cancel", "leave", icon="↩️")]])
 
     if data == "exec_leave_all":
+        if sharding_runtime_enabled():
+            task_id = await enqueue_internal_worker_fanout(
+                "leave_all", {"by": "bot"})
+            await event.answer("Leave sent to all account workers")
+            return await safe_edit(event, card(E_REFRESH, "Leave All Queued", [
+                field(E_REFRESH, "Task", str(task_id)),
+                "",
+                S("Every worker will leave all chats for its own account IDs."),
+            ]), kb_nav())
         await safe_edit(event, card(E_REFRESH, "Working", [S("Starting...")]))
         return await execute_leave_all(event)
 
@@ -6243,6 +6401,17 @@ async def route_callback(event, uid, owner, data):
         return await show_live_now(event)
 
     if data == "live_stop_all":
+        if sharding_runtime_enabled():
+            task_id = await enqueue_internal_worker_fanout(
+                "live_stop", {"by": "bot"})
+            await event.answer("Stop sent to all account workers")
+            return await safe_edit(event, card(E_REFRESH, "Stopping Live Calls", [
+                field(E_REFRESH, "Task", str(task_id)),
+                "",
+                S("Every worker is removing its own accounts from the call."),
+                S("Open Live Now again after a few seconds to verify."),
+            ]), [[btn("Live Now", "live_now", icon="🎤")],
+                 [btn("Home", "home", icon="🏠")]])
         n = 0
         for chat, keys in list(LIVE_AUDIO.items()):
             for key in list(keys):
@@ -6255,6 +6424,17 @@ async def route_callback(event, uid, owner, data):
     # Pull every account out of one specific call, leaving other calls running.
     if data.startswith("live_stop_"):
         chat = int(data[len("live_stop_"):])
+        if sharding_runtime_enabled():
+            task_id = await enqueue_internal_worker_fanout(
+                "live_stop", {"chat_id": chat, "by": "bot"})
+            await event.answer("Stop sent to all account workers")
+            return await safe_edit(event, card(E_REFRESH, "Stopping Stream", [
+                field(E_CHANNEL, "Channel", str(chat)),
+                field(E_REFRESH, "Task", str(task_id)),
+                "",
+                S("Every worker is removing its own accounts from this call."),
+            ]), [[btn("Live Now", "live_now", icon="🎤")],
+                 [btn("Home", "home", icon="🏠")]])
         keys = list(LIVE_AUDIO.get(chat, set()))
         for key in keys:
             await stop_live_audio(key, chat)
@@ -6954,6 +7134,15 @@ async def route_message(event, state, text):
     # ── leave one ─────────────────────────────────────────────
     if t == "leave_specific":
         task_states.pop(chat_id, None)
+        if sharding_runtime_enabled():
+            task_id = await enqueue_internal_worker_fanout(
+                "leave", {"target": text, "by": "bot"})
+            return await event.respond(card(E_CHECK, "Leave Queued", [
+                field(E_CHANNEL, "Target", esc(text[:80])),
+                field(E_REFRESH, "Task", str(task_id)),
+                "",
+                S("Every worker will remove its own account IDs."),
+            ]), buttons=kb_nav())
         return await execute_leave_specific(event, text)
 
 
@@ -6971,36 +7160,55 @@ async def flow_go_live(event, state, text):
         ltype, target = parse_target(text)
         if ltype not in ("public", "private"):
             return await bad(event, "That is not a valid channel link.", "home")
+        candidates = await live_selection_candidates()
         state.update({"link": text.strip(), "ltype": ltype, "target": target,
-                      "step": "count"})
-        available = await available_account_count()
-        return await event.respond(card(E_PERSON, "Go Live", [
+                      "live_candidates": candidates, "step": "count"})
+        available = len(candidates)
+        preview = live_account_id_lines(candidates)
+        lines = [
             field(E_CHANNEL, "Channel", esc(text.strip())),
-            field(E_GREEN, "Accounts across workers", str(available)),
+            field(E_GREEN, "Free accounts", str(available)),
             field(E_CHECK, "Accounts per worker", str(ACCOUNT_SHARD_SIZE)),
             field(E_SHIELD, "Stream limit", cap_text()),
             field(E_REFRESH, "Rotation", rotate_text()),
             "",
-            f"{S('How many accounts should join the live stream?')} "
-            f"(1-{live_limit(available)})",
-        ]), buttons=[[btn("Cancel", "home", icon="↩️")]])
+            f"{E_PERSON} <b>{S('Available account IDs')}</b>",
+        ]
+        lines += preview or [S("No free account is available right now.")]
+        lines += ["", f"{S('Send how many of the IDs above should join')} "
+                  f"(1-{live_limit(available)})."]
+        return await event.respond(card(E_PERSON, "Go Live", lines),
+                                    buttons=[[btn("Cancel", "home", icon="↩️")]])
 
     if state["step"] == "count":
         if not text.isdigit() or int(text) < 1:
             return await bad(event, "Send a whole number.", "home")
-        available = await available_account_count()
-        n = live_limit(min(int(text), available))
+        candidates = await live_selection_candidates()
+        requested = int(text)
+        n = live_limit(min(requested, len(candidates)))
+        if n < 1:
+            return await bad(event, "No free account is available for this live.", "home")
+        selected = candidates[:n]
         task_states.pop(event.chat_id, None)
+        selected_lines = live_account_id_lines(selected, limit=20)
         if sharding_runtime_enabled():
             task_id = await enqueue_internal_worker_fanout(
-                "manual_live", {"target": state["link"], "count": n})
+                "manual_live", {"target": state["link"], "count": n,
+                                 "keys": selected, "by": "bot"})
             return await event.respond(card(E_CHECK, "Live Queued", [
-                field(E_PERSON, "Accounts requested", str(n)),
+                field(E_PERSON, "Selected accounts", str(n)),
                 field(E_REFRESH, "Task", str(task_id)),
                 "",
-                S("Each worker will use only its own ten-account shard."),
+                f"{E_PERSON} <b>{S('Selected account IDs')}</b>",
+                *selected_lines,
+                "",
+                S("Each worker will use only the selected IDs it owns."),
             ]), buttons=[[btn("Live Now", "live_now", icon="🎤"),
                          btn("Home", "home", icon="🏠")]])
+        # Keep extra IDs as the rotation pool, but the first n IDs are the
+        # streamers shown to the owner.
+        pool_count = n * LIVE_POOL_MULT if LIVE_ROTATE else n
+        state["selected_keys"] = candidates[:pool_count]
         return await execute_go_live(event, state, n)
 
 
@@ -7025,9 +7233,15 @@ async def execute_go_live(event, state, count):
     # Least-busy first so a Go Live does not lean on the accounts that are
     # already carrying the most client channels.
     load = await account_load()
-    candidates = free_live_keys(acc_keys())
-    random.shuffle(candidates)
-    candidates.sort(key=lambda k: load.get(k, 0))
+    preselected = [str(key) for key in (state.get("selected_keys") or [])]
+    if preselected:
+        # The owner has already seen these IDs in the picker. Do not silently
+        # replace them with different accounts if one becomes unavailable.
+        candidates = free_live_keys(preselected)
+    else:
+        candidates = free_live_keys(acc_keys())
+        random.shuffle(candidates)
+        candidates.sort(key=lambda k: load.get(k, 0))
     pool_size = min(len(candidates),
                     count * LIVE_POOL_MULT if LIVE_ROTATE else count)
     keys = candidates[:pool_size]
@@ -7115,7 +7329,10 @@ async def execute_go_live(event, state, count):
     ok, errors = await join_live_with_audio(streamers, chat_id, state["link"])
 
     lines = [field(E_CHANNEL, "Channel", esc(state["link"])),
-             field(E_CHECK, "Streaming", f"{ok} / {len(streamers)}")]
+             field(E_CHECK, "Streaming", f"{ok} / {len(streamers)}"),
+             "",
+             f"{E_PERSON} <b>{S('Account IDs in this live')}</b>"]
+    lines += live_account_id_lines(streamers, limit=20)
     if LIVE_ROTATE:
         lines.append(field(E_REFRESH, "Rotation",
                            f"{rotate_text()} ({len(usable)} {S('in pool')})"))

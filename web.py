@@ -396,6 +396,35 @@ tbody tr:hover { background: rgba(255, 255, 255, 0.02); }
 }
 .filter-bar input { flex: 1; min-width: 220px; }
 .filter-bar input:focus, .filter-bar select:focus { border-color: var(--blue); }
+.live-picker {
+  max-height: 190px;
+  overflow: auto;
+  margin: 10px 0 12px;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: rgba(0,0,0,.16);
+}
+.live-account {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 8px;
+  border-radius: 7px;
+  font-size: 12px;
+}
+.live-account:hover { background: rgba(255,255,255,.05); }
+.live-account input { accent-color: var(--blue); }
+.live-account .worker { color: var(--muted); margin-left: auto; }
+.live-call-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--line);
+}
+.live-call-row:last-child { border-bottom: none; }
 
 /* Activity detail modal */
 .modal-backdrop {
@@ -526,6 +555,8 @@ tbody tr:hover { background: rgba(255, 255, 255, 0.02); }
 const app = document.getElementById('app');
 let timer = null;
 let activityFilters = { search: '', action: 'all', status: 'all' };
+let liveAccountRows = [];
+let liveSelected = new Set();
 
 const esc = x => String(x ?? '').replace(/[&<>"']/g, m => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
@@ -684,6 +715,86 @@ async function uploadPhoto() {
   if (res) res.innerHTML = d?.id ? `Photo task queued! Task ID: <strong>${esc(d.id)}</strong>` : `<span class="red">Upload failed</span>`;
 }
 
+function renderLiveAccounts() {
+  const box = document.getElementById('live-account-list');
+  if (!box) return;
+  const query = (document.getElementById('live-account-search')?.value || '').toLowerCase().trim();
+  const visible = liveAccountRows.filter(x => !query || `${x.id} worker.${x.worker}`.toLowerCase().includes(query));
+  box.innerHTML = visible.length ? visible.map(x => `
+    <label class="live-account">
+      <input type="checkbox" value="${esc(x.id)}" ${liveSelected.has(x.id) ? 'checked' : ''} ${x.available ? '' : 'disabled'} onchange="toggleLiveAccount(this.value, this.checked)">
+      <span>${esc(x.id)}</span>
+      <span class="worker">worker.${x.worker}${x.streaming ? ' · LIVE' : x.online ? '' : ' · offline'}</span>
+    </label>
+  `).join('') : '<div style="padding:12px;color:var(--muted)">No available account matches this search.</div>';
+  const count = document.getElementById('manual-live-count');
+  if (count && liveSelected.size) count.value = liveSelected.size;
+  const picked = document.getElementById('live-picked-count');
+  if (picked) picked.textContent = `${liveSelected.size} selected / ${liveAccountRows.filter(x => x.available).length} available`;
+}
+
+function toggleLiveAccount(id, checked) {
+  if (checked) liveSelected.add(id); else liveSelected.delete(id);
+  renderLiveAccounts();
+}
+
+async function loadLiveAccounts() {
+  const d = await get('/api/live-accounts');
+  if (!d) return;
+  liveAccountRows = d.rows || [];
+  const available = new Set(liveAccountRows.filter(x => x.available).map(x => x.id));
+  liveSelected = new Set([...liveSelected].filter(x => available.has(x)));
+  renderLiveAccounts();
+}
+
+async function startManualLive() {
+  const target = document.getElementById('manual-live-target')?.value.trim();
+  const requested = Number(document.getElementById('manual-live-count')?.value || 0);
+  if (!target) { alert('Live channel link is required'); return; }
+  const keys = [...liveSelected];
+  const count = keys.length || requested;
+  if (!count || count < 1) { alert('Select account IDs or enter an account count'); return; }
+  const result = document.getElementById('result');
+  if (result) result.textContent = 'Queuing selected live accounts...';
+  const d = await get('/api/actions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      action: 'manual_live',
+      params: { target, count, keys, by: 'dashboard' }
+    })
+  });
+  if (result) result.innerHTML = d?.id
+    ? `Live task queued: <strong>${esc(d.id)}</strong> (${keys.length ? `${keys.length} selected IDs` : `${count} accounts`})`
+    : `<span class="red">Live task could not be queued</span>`;
+}
+
+async function loadLiveCalls() {
+  const box = document.getElementById('live-call-list');
+  if (!box) return;
+  const d = await get('/api/live-calls');
+  if (!d) return;
+  box.innerHTML = d.rows.length ? d.rows.map(x => `
+    <div class="live-call-row">
+      <div><strong>${esc(x.label || x.chat_id)}</strong><div style="color:var(--muted);font-size:11px;">${x.accounts} account IDs · ${esc(x.chat_id)}</div></div>
+      <button class="btn danger sm" onclick="stopLiveCall('${esc(x.chat_id)}')">Leave</button>
+    </div>
+  `).join('') : '<div style="color:var(--muted);font-size:12px;padding:8px 0;">No active live calls.</div>';
+}
+
+async function stopLiveCall(chatId) {
+  const result = document.getElementById('result');
+  const d = await get('/api/actions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'live_stop', params: { chat_id: chatId, by: 'dashboard' } })
+  });
+  if (result) result.innerHTML = d?.id
+    ? `Leave task queued: <strong>${esc(d.id)}</strong>`
+    : `<span class="red">Leave task could not be queued</span>`;
+  setTimeout(loadLiveCalls, 2500);
+}
+
 async function actions() {
   app.innerHTML = `
     <div class="page-header">
@@ -696,7 +807,18 @@ async function actions() {
       ${actionForm('Random Names', 'random_names', [['names', 'Blank = Indian 500 names pool']], 'Assign Random')}
       ${actionForm('Post Reactions', 'react', [['target', 'Post link (t.me/c/...)'], ['emoji', 'Emoji (optional)']])}
       ${actionForm('Post Views', 'views', [['target', 'Post link (t.me/c/...)']])}
-      ${actionForm('Start Live VC', 'live_start', [['target', 'Channel / Group link']], 'Start Live')}
+      <div class="form">
+        <h3>🎤 Start Live VC</h3>
+        <input id="manual-live-target" placeholder="Live channel link">
+        <div style="display:flex;gap:8px;">
+          <input id="manual-live-count" type="number" min="1" placeholder="Count" style="margin-bottom:0;">
+          <button class="btn secondary" onclick="loadLiveAccounts()" type="button">Load IDs</button>
+        </div>
+        <input id="live-account-search" placeholder="Search account ID..." oninput="renderLiveAccounts()" style="margin-top:10px;">
+        <div id="live-account-list" class="live-picker"><div style="padding:12px;color:var(--muted)">Press Load IDs to see available account IDs.</div></div>
+        <div id="live-picked-count" style="color:var(--muted);font-size:12px;margin-bottom:10px;">0 selected</div>
+        <button class="btn" onclick="startManualLive()">Start Selected Live</button>
+      </div>
 
       <div class="form">
         <h3>Update Profile Photo</h3>
@@ -706,14 +828,17 @@ async function actions() {
 
       <div class="form">
         <h3>Live Voice Controls</h3>
-        <div style="display:flex; flex-direction:column; gap:10px; margin-top:auto;">
+        <div style="display:flex; flex-direction:column; gap:10px;">
+          <button class="btn secondary" onclick="loadLiveCalls()">↻ Refresh Live Calls</button>
           <button class="btn secondary" onclick="runAction('live_rotate')">🔄 Rotate Live Accounts</button>
           <button class="btn danger" onclick="runAction('live_stop')">🛑 Stop All Live Calls</button>
+          <div id="live-call-list" style="margin-top:4px;"><div style="color:var(--muted);font-size:12px;">Loading live calls...</div></div>
         </div>
       </div>
     </div>
     <div id="result" class="result-box">Select or configure an action above to trigger worker tasks.</div>
   `;
+  loadLiveCalls();
 }
 
 /* --- ACCOUNTS & SESSIONS (CONSOLIDATED) --- */
@@ -1336,9 +1461,14 @@ def api_summary():
     slots = sorted(set(int(d.get("slot", 0) or 0) for d in docs))
     owners = {d.get("owner") for d in docs if d.get("owner") and d.get("lease_until") and d["lease_until"] > now()}
     clients = db["clients"]
-    live_rows = list(db["live_state"].find({}))
-    voice_accounts = sum(len(row.get("keys", [])) for row in live_rows)
-    voice_memberships = sum(int(row.get("target", 0) or 0) for row in live_rows)
+    live_groups = {}
+    for row in db["live_state"].find({}):
+        chat_id = str(row.get("chat_id") or row.get("_id") or "")
+        group = live_groups.setdefault(chat_id, {"keys": set(), "target": 0})
+        group["keys"].update(str(key) for key in (row.get("keys") or []))
+        group["target"] += int(row.get("target", 0) or 0)
+    voice_accounts = sum(len(group["keys"]) for group in live_groups.values())
+    voice_memberships = sum(group["target"] for group in live_groups.values())
     tasks = _activity_tasks(limit=12)
     data = {
         "total": total,
@@ -1351,7 +1481,7 @@ def api_summary():
         "slots": slots,
         "clients": clients.count_documents({"status": "active"}),
         "voice": {
-            "active": len(live_rows),
+            "active": len(live_groups),
             "accounts": voice_accounts,
             "memberships": voice_memberships,
             "max_per_account": 1
@@ -1373,6 +1503,47 @@ def api_sessions():
             "online": bool(d.get("lease_until") and d["lease_until"] > now()),
             "updated": d.get("updated_at", now()).strftime("%d %b %H:%M") if hasattr(d.get("updated_at"), "strftime") else "-"
         })
+    return jsonify({"rows": rows})
+
+
+@app.get("/api/live-accounts")
+def api_live_accounts():
+    if (err := guard()): return err
+    busy = set()
+    for live in db["live_state"].find({}, {"keys": 1}):
+        busy.update(str(key) for key in (live.get("keys") or []))
+    current = now()
+    rows = []
+    for doc in db["account_shards"].find(
+        {}, {"account_key": 1, "slot": 1, "lease_until": 1}
+    ).sort([("slot", 1), ("account_key", 1)]):
+        key = str(doc.get("account_key") or doc.get("_id") or "")
+        online = bool(doc.get("lease_until") and doc["lease_until"] > current)
+        streaming = key in busy
+        rows.append({
+            "id": key,
+            "worker": int(doc.get("slot", 0) or 0) + 1,
+            "online": online,
+            "streaming": streaming,
+            "available": online and not streaming,
+        })
+    return jsonify({"rows": rows})
+
+
+@app.get("/api/live-calls")
+def api_live_calls():
+    if (err := guard()): return err
+    groups = {}
+    for row in db["live_state"].find({}):
+        chat_id = str(row.get("chat_id") or row.get("_id") or "")
+        group = groups.setdefault(chat_id, {"chat_id": chat_id, "label": "",
+                                            "keys": set(), "target": 0})
+        group["label"] = group["label"] or str(row.get("label") or "")
+        group["keys"].update(str(key) for key in (row.get("keys") or []))
+        group["target"] += int(row.get("target", 0) or 0)
+    rows = [{"chat_id": value["chat_id"], "label": value["label"],
+             "accounts": len(value["keys"]), "target": value["target"]}
+            for value in groups.values() if value["keys"]]
     return jsonify({"rows": rows})
 
 
@@ -1476,7 +1647,7 @@ def api_actions():
     if (err := guard()): return err
     body = request.get_json(silent=True) or {}
     action = str(body.get("action", "")).strip()
-    if action not in {"join", "leave", "react", "views", "set_name", "random_names", "live_start", "live_stop", "live_rotate"}:
+    if action not in {"join", "leave", "react", "views", "set_name", "random_names", "manual_live", "live_start", "live_stop", "live_rotate"}:
         return jsonify({"error": "unsupported action"}), 400
     params = body.get("params") or {}
     parent_id, slots = queue_fanout(action, params)

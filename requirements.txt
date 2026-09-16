@@ -1,6 +1,13 @@
+# The bot itself needs motor/pymongo (MongoDB) and telethon (via pytgcalls).
+# They were missing here, so a fresh `./start` install crashed on
+# "from motor.motor_asyncio import AsyncIOMotorClient" before the bot booted.
+telethon>=1.30
 python-telegram-bot==20.7
 pyrogram==2.0.106
 tgcrypto==1.2.5
 pydub==0.25.1
 ffmpeg-python==0.2.0
+pytgcalls
 ntgcalls
+motor>=3.3
+pymongo>=4.0

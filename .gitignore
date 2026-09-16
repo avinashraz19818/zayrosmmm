@@ -6,3 +6,6 @@ __pycache__/
 .bot.pid
 bot.log
 sessions/
+sessions_trash/
+*.session-wal
+*.session-shm

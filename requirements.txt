@@ -1,13 +1,14 @@
-# The bot itself needs motor/pymongo (MongoDB) and telethon (via pytgcalls).
-# They were missing here, so a fresh `./start` install crashed on
-# "from motor.motor_asyncio import AsyncIOMotorClient" before the bot booted.
-telethon>=1.30
-python-telegram-bot==20.7
-pyrogram==2.0.106
+# Telegram client and durable MongoDB/GridFS persistence
+Telethon==1.44.0
+motor==3.7.1
+pymongo==4.17.0
 tgcrypto==1.2.5
-pydub==0.25.1
+
+# Optional live-audio support used by the Audio/Go Live menu
+py-tgcalls==2.3.3
 ffmpeg-python==0.2.0
-pytgcalls
-ntgcalls
-motor>=3.3
-pymongo>=4.0
+pydub==0.25.1
+
+# Authenticated Heroku web dashboard
+Flask==3.1.1
+gunicorn==23.0.0

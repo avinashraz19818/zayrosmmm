@@ -1,0 +1,12 @@
+# Runtime data is restored from MongoDB/GridFS. Never put sessions or secrets
+# into the Heroku slug.
+sessions/
+sessions_trash/
+bot_session.session
+bot_session.session-*
+.env
+.env.*
+
+# The VPS audio copy is already in MongoDB/GridFS. Excluding it keeps the slug
+# small; Home > Audio can upload/replace it after deployment.
+audio/live.mp3

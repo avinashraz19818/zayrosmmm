@@ -4106,6 +4106,29 @@ def globally_ordered_joined(joined: list) -> list:
     )
 
 
+def split_package_for_shard(joined_global, count, is_local=None):
+    """Split one post package across worker shards without changing the total.
+
+    ``joined_global`` must be the subscription's full joined list in
+    deterministic fleet order (``globally_ordered_joined``) and ``count`` the
+    whole package (reactions or views for one post). Every worker takes the
+    SAME global first-``count`` selection and keeps only the keys it owns
+    (``is_local``), so the slice is stable and identical everywhere.
+
+    Summed over the fleet the delivered count equals ``count`` exactly. The
+    old code filtered the pool down to local sessions *before* slicing, so on
+    a 3-dyno fleet every worker sent ``min(package, shard_size)`` — a
+    10-reaction package silently became 30, and a package larger than one
+    shard came up short. ``is_local=None`` (single process) returns the plain
+    first-``count`` slice, exactly like the old non-sharded behaviour.
+    """
+    count = max(0, int(count or 0))
+    global_pick = list(joined_global[:count])
+    if is_local is None:
+        return global_pick, list(global_pick)
+    return global_pick, [k for k in global_pick if is_local(k)]
+
+
 async def process_new_post(channel_id: int, message_id: int):
     subs = await get_active_subscriptions_for_channel(channel_id)
     if not subs:
@@ -4116,16 +4139,31 @@ async def process_new_post(channel_id: int, message_id: int):
             await update_client_status(str(sub["_id"]), "expired")
             continue
 
-        # Only accounts that can really deliver count: a dead, frozen or
-        # offline session took a slot here and produced nothing, which is why
-        # some posts came up short while the log said the package was planned.
         recorded = globally_ordered_joined(sub.get("joined_accounts", []))
-        joined = [k for k in recorded if account_usable(k)]
-        if not joined:
-            logger.info(f"sub {sub['_id']}: no usable joined account "
-                        f"({len(recorded)} recorded, "
-                        f"{len(recorded) - len(joined)} dead/frozen/offline)")
-            continue
+        if sharding_runtime_enabled():
+            # Fleet-wide pool: every worker must count the subscription's WHOLE
+            # joined list before slicing, not just the sessions it owns.
+            # ACCOUNTS only holds this shard's sessions, so the old local
+            # account_usable() filter shrank the pool to one shard and each
+            # worker then sent min(package, shard_size) — workers x package in
+            # total, or short once the package outgrew a single shard. Local
+            # usability is still enforced per account inside deliver() and the
+            # spares; unreachable sessions simply fail over there.
+            joined = list(recorded)
+            if not joined:
+                logger.info(f"sub {sub['_id']}: no joined accounts on record")
+                continue
+        else:
+            # Single process: only accounts that can really deliver count — a
+            # dead, frozen or offline session took a slot here and produced
+            # nothing, which is why some posts came up short while the log
+            # said the package was planned.
+            joined = [k for k in recorded if account_usable(k)]
+            if not joined:
+                logger.info(f"sub {sub['_id']}: no usable joined account "
+                            f"({len(recorded)} recorded, "
+                            f"{len(recorded) - len(joined)} dead/frozen/offline)")
+                continue
 
         spec = sub.get("channel_username") or norm_channel_id(sub.get("channel_id")) \
             or channel_id
@@ -4135,11 +4173,12 @@ async def process_new_post(channel_id: int, message_id: int):
         # In sharded mode the package is selected globally, then each worker
         # executes only the selected keys it owns. Without this split every
         # worker would send the full package and multiply reactions/views by
-        # the number of workers.
-        global_react = joined[:n_react]
-        global_view = joined[:n_views]
-        react_keys = [k for k in global_react if local_worker_account(k)]
-        view_keys = [k for k in global_view if local_worker_account(k)]
+        # the number of workers. The split keeps the local slice order aligned
+        # with the global order, so the emoji plan indexes still match.
+        global_react, react_keys = split_package_for_shard(
+            joined, n_react, local_worker_account)
+        global_view, view_keys = split_package_for_shard(
+            joined, n_views, local_worker_account)
         for k in react_keys:
             ACC_INFLIGHT[k] = ACC_INFLIGHT.get(k, 0) + 1
         try:
@@ -4251,16 +4290,30 @@ async def process_new_post(channel_id: int, message_id: int):
         await increment_stats(reactions=done["react"], views=done["view"])
         # Report what actually landed, not what was planned. The old line
         # printed the plan, so a post that delivered half looked perfect in the
-        # log — which is why short deliveries went unnoticed.
+        # log — which is why short deliveries went unnoticed. In sharded mode
+        # each worker measures itself against ITS OWN slice of the package:
+        # comparing local deliveries with the whole package would cry SHORT on
+        # every dyno even when the fleet delivered the full count together.
+        want_react = len(react_keys)
+        want_view = len(view_keys)
+        if sharding_runtime_enabled() and not want_react and not want_view:
+            # Another shard owns this slice of the package; stay quiet.
+            continue
         short = []
-        if done["react"] < n_react:
-            short.append(f"reactions {done['react']}/{n_react}")
-        if done["view"] < n_views:
-            short.append(f"views {done['view']}/{n_views}")
+        if done["react"] < want_react:
+            short.append(f"reactions {done['react']}/{want_react}")
+        if done["view"] < want_view:
+            short.append(f"views {done['view']}/{want_view}")
         if short:
-            logger.warning(f"post {message_id}: SHORT — {', '.join(short)} "
-                           f"for {sub.get('client_name')} "
-                           f"({len(joined)} accounts in channel)")
+            if sharding_runtime_enabled():
+                logger.warning(f"post {message_id}: SHORT — {', '.join(short)} "
+                               f"for {sub.get('client_name')} (shard slice of "
+                               f"package {n_react} react / {n_views} view, "
+                               f"{len(joined)} accounts in channel fleet-wide)")
+            else:
+                logger.warning(f"post {message_id}: SHORT — {', '.join(short)} "
+                               f"for {sub.get('client_name')} "
+                               f"({len(joined)} accounts in channel)")
         else:
             logger.info(f"post {message_id}: {done['react']} reactions, "
                         f"{done['view']} views for {sub.get('client_name')}")

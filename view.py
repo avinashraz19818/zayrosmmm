@@ -1,15 +1,21 @@
 """
 Telegram account manager / SMM bot.
 
-Accounts live in the sessions/ folder (that folder is the single source of truth
-for logins). MongoDB holds only client subscriptions, approved users and the
-activity log — no session material.
+MongoDB is the source of truth for client data, approvals, activity, Telegram
+sessions, the bot session, the session trash and the live-audio file. Telethon
+still needs local SQLite files while a dyno is running, so session files are
+restored into an ephemeral working directory at boot and synced back to MongoDB.
+That makes Heroku dyno restarts/redeploys safe instead of treating the dyno disk
+as permanent storage.
 """
 
 import asyncio
 import contextlib
+import hashlib
+import io
 import logging
 import re
+import secrets
 import sys
 import datetime
 import random
@@ -17,21 +23,25 @@ import os
 import json
 import zipfile
 import shutil
+import signal
 import sqlite3
 import tempfile
 import time
+import urllib.request
+import urllib.error
 from html import escape as esc
 from math import ceil
 from typing import Dict, List, Optional, Tuple
 
 from telethon import TelegramClient, events, Button, utils
-from telethon.sessions import StringSession
+from telethon.sessions import StringSession, MemorySession
 from telethon.errors import (
     SessionPasswordNeededError,
     FloodWaitError,
     UserAlreadyParticipantError,
     InviteRequestSentError,
     MessageNotModifiedError,
+    QueryIdInvalidError,
 )
 from telethon.tl.functions.messages import (
     ImportChatInviteRequest,
@@ -57,8 +67,10 @@ from telethon.tl.types import (
     UpdateGroupCall, GroupCall,
     InputCheckPasswordSRP, PasswordKdfAlgoSHA256SHA256PBKDF2HMACSHA512iter100000SHA256ModPow,
 )
-from motor.motor_asyncio import AsyncIOMotorClient
+from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorGridFSBucket
 from bson.objectid import ObjectId
+from pymongo import InsertOne, ReturnDocument, UpdateOne
+from random_names import INDIAN_RANDOM_NAMES
 
 # Optional so the bot still boots on a host without ffmpeg/ntgcalls; every
 # live-audio path checks TGCALLS_OK first and reports the missing dependency
@@ -90,20 +102,101 @@ for _noisy in ("telethon", "telethon.client.updates", "telethon.network",
     logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 # ═══════════════════════ CONFIGURATION ═══════════════════════
-API_ID = 21538384
-API_HASH = "9b8e9b10a5c34b67054aceca02bf423e"
-BOT_TOKEN = "8912703088:AAG1YBb91E3l0h6Uqdk0azztRpRSnwpYva0"
-MONGO_URI = "mongodb+srv://avinash:avinash12@cluster0.wnwd1fv.mongodb.net/?appName=Cluster0"
+def _env_int(name: str, default: int = 0) -> int:
+    try:
+        return int(os.getenv(name, str(default)).strip())
+    except (TypeError, ValueError):
+        return default
 
-OWNER_IDS = [8015937475]
+
+API_ID = _env_int("API_ID")
+API_HASH = os.getenv("API_HASH", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+# A localhost URI is only a development fallback. Heroku must receive the
+# Atlas URI through Config Vars; no secret is kept in the repository.
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://127.0.0.1:27017").strip()
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "tg_manager_bot").strip() or "tg_manager_bot"
+GRIDFS_BUCKET = os.getenv("MONGO_GRIDFS_BUCKET", "tg_manager_storage").strip() or "tg_manager_storage"
+OWNER_IDS = [
+    int(part.strip())
+    for part in os.getenv("OWNER_IDS", "").split(",")
+    if part.strip().lstrip("-").isdigit()
+]
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SESSIONS_DIR = os.path.join(BASE_DIR, "sessions")
-TRASH_DIR = os.path.join(BASE_DIR, "sessions_trash")
+# The dyno filesystem is deliberately only a working cache. The old VPS paths
+# are retained as migration sources when they exist, but are never the source
+# of truth after boot.
+LEGACY_SESSIONS_DIR = os.path.join(BASE_DIR, "sessions")
+LEGACY_TRASH_DIR = os.path.join(BASE_DIR, "sessions_trash")
+LEGACY_AUDIO_PATH = os.path.join(BASE_DIR, "audio", "live.mp3")
+LEGACY_BOT_SESSION_BASE = os.path.join(BASE_DIR, "bot_session")
+RUNTIME_ROOT = os.getenv("RUNTIME_DIR", "").strip() or tempfile.mkdtemp(prefix="tg-manager-")
+SESSIONS_DIR = os.path.join(RUNTIME_ROOT, "sessions")
+TRASH_DIR = os.path.join(RUNTIME_ROOT, "sessions_trash")
+AUDIO_DIR = os.path.join(RUNTIME_ROOT, "audio")
+LIVE_AUDIO_PATH = os.path.join(AUDIO_DIR, "live.mp3")
+BOT_SESSION_BASE = os.path.join(RUNTIME_ROOT, "bot_session")
 os.makedirs(SESSIONS_DIR, exist_ok=True)
-os.makedirs(os.path.join(BASE_DIR, "audio"), exist_ok=True)
+os.makedirs(TRASH_DIR, exist_ok=True)
+os.makedirs(AUDIO_DIR, exist_ok=True)
+
+# These are configuration errors, not Telegram/account errors. main() prints a
+# useful message and exits before trying to connect when any required secret is
+# absent.
+CONFIG_MISSING = [
+    name for name, value in (("API_ID", API_ID), ("API_HASH", API_HASH),
+                             ("BOT_TOKEN", BOT_TOKEN),
+                             ("MONGO_URI", os.getenv("MONGO_URI", "").strip()),
+                             ("OWNER_IDS", OWNER_IDS))
+    if not value or value == 0
+]
+
+# Mongo/GridFS is authoritative. Files are materialised locally only because
+# Telethon and ffmpeg require filesystem paths. The manifest lets us replace a
+# GridFS object atomically and avoids duplicate versions on every dyno restart.
+STORAGE_SYNC_INTERVAL = max(30, _env_int("STORAGE_SYNC_INTERVAL", 120))
+# Session probing is network-bound. A small bounded fan-out is much faster than
+# importing a ZIP one account at a time, while still avoiding a Telegram flood
+# storm on a dyno.
+SESSION_CONNECT_CONCURRENCY = max(4, _env_int("SESSION_CONNECT_CONCURRENCY", 12))
+ZIP_IMPORT_CONCURRENCY = max(4, _env_int("ZIP_IMPORT_CONCURRENCY", 12))
+SESSION_PROBE_TIMEOUT = max(30, _env_int("SESSION_PROBE_TIMEOUT", 60))
+
+# ── Account worker sharding ────────────────────────────────────────────────
+# On Heroku, DYNO is worker.1, worker.2, ... . Each worker owns at most ten
+# Telegram sessions. The shard map and leases live in MongoDB, so a restart or
+# move to another Heroku app cannot make two workers open the same session.
+ACCOUNT_SHARDING = os.getenv("ACCOUNT_SHARDING", "true").strip().lower() not in {
+    "0", "false", "no", "off",
+}
+ACCOUNT_SHARD_SIZE = max(1, _env_int("ACCOUNT_SHARD_SIZE", 10))
+HEROKU_APP_NAME = os.getenv("HEROKU_APP_NAME", "").strip()
+HEROKU_API_KEY = os.getenv("HEROKU_API_KEY", "").strip()
+DASHBOARD_URL = os.getenv("DASHBOARD_URL", "").strip().rstrip("/")
+DASHBOARD_SESSION_SECRET = os.getenv("DASHBOARD_SESSION_SECRET", "").strip()
+WORKER_RECONCILE_INTERVAL = max(30, _env_int("WORKER_RECONCILE_INTERVAL", 60))
+DYNO_NAME = os.getenv("DYNO", "").strip()
+
+
+def worker_slot_from_dyno(dyno: str) -> int:
+    match = re.search(r"(?:worker|account_worker)\.(\d+)$", dyno or "")
+    return max(0, int(match.group(1)) - 1) if match else 0
+
+
+WORKER_SLOT = worker_slot_from_dyno(DYNO_NAME)
+# Include the PID so a rolling restart with the same DYNO name cannot share a
+# lease with the previous process.
+WORKER_INSTANCE_ID = f"{DYNO_NAME or 'local-worker'}.{os.getpid()}"
+# Only worker.1 polls bot updates and sends reminders. Account workers run
+# their assigned user sessions and Telegram channel monitors.
+IS_CONTROLLER_WORKER = WORKER_SLOT == 0
+SHARD_LEASE_SECONDS = 120
 
 # Every live audio stream costs an ffmpeg process, a WebRTC connection and a
+# second MTProto socket. The usual 1024-descriptor default runs out partway
+# through a large fleet, and the first casualty is Telethon's session sqlite —
+# so accounts start dropping for a reason that looks nothing like the cause., a WebRTC connection and a
 # second MTProto socket. The usual 1024-descriptor default runs out partway
 # through a large fleet, and the first casualty is Telethon's session sqlite —
 # so accounts start dropping for a reason that looks nothing like the cause.
@@ -153,9 +246,9 @@ MONITOR_CLIENTS = 5
 LIVE_POLL_SECONDS = 20
 # Telegram drops a silent participant after ~60s, so re-assert well inside that.
 LIVE_KEEPALIVE_SECONDS = 30
-# The MP3 every account streams into a live call.
-AUDIO_DIR = os.path.join(BASE_DIR, "audio")
-LIVE_AUDIO_PATH = os.path.join(AUDIO_DIR, "live.mp3")
+# The MP3 every account streams into a live call. AUDIO_DIR/LIVE_AUDIO_PATH
+# point at the ephemeral working copy declared in the configuration block;
+# the canonical copy lives in MongoDB GridFS under ``audio/live.mp3``.
 # ffmpeg restarts the file this many times. NOT -1: py-tgcalls filters argv
 # against `ffmpeg -h full` and drops any token starting with "-", which would
 # silently strip the "-1" and leave a broken bare "-stream_loop".
@@ -192,6 +285,11 @@ FD_HEADROOM = 200
 # short of it so there is room for the odd manual join and for Go Live.
 MAX_CHANNELS_PER_ACCOUNT = 450
 KEEP_ALIVE_INTERVAL = 300
+# How many accounts get a full server-side health check per keep-alive cycle.
+# The presence ping alone cannot tell a deleted login from a live one when
+# Telegram answers it normally, so a rotating slice of the fleet is asked
+# outright. 30 per 5 minutes covers a 200-account fleet in about half an hour.
+HEALTH_PROBE_PER_CYCLE = 30
 PER_PAGE = 8
 # When a new account is added (phone login, string session or ZIP import) walk
 # it into every active client channel in the background, and add it to those
@@ -229,6 +327,9 @@ recent_messages: set = set()
 active_calls: dict = {}
 # account_key -> PyTgCalls instance (created lazily, one per account)
 TGCALLS: Dict[str, object] = {}
+# A stream_end callback is normally restarted for resilience. These markers
+# distinguish an owner-requested leave from an unexpected ffmpeg/network drop.
+INTENTIONAL_LIVE_STOPS: Dict[Tuple[str, int], float] = {}
 # channel_id -> set of account keys currently streaming audio there
 LIVE_AUDIO: Dict[int, set] = {}
 # channel_id -> {"pool": [keys usable for this call], "target": how many should
@@ -250,6 +351,18 @@ _LAST_MONITOR_STATE: Optional[Tuple[int, int]] = None
 ALLOWED_REACTIONS_CACHE: Dict[str, Optional[list]] = {}
 # (account_key, peer_spec) -> resolved input entity
 PEER_CACHE: Dict[Tuple[str, str], object] = {}
+# (mtime_ns, size) -> (valid, reason), so ten live accounts do not each run a
+# separate 30-second ffprobe for the same audio file.
+AUDIO_VALIDATION_CACHE: Optional[Tuple[int, int, bool, str]] = None
+# Remote session filename -> assigned worker slot, and account key -> slot.
+WORKER_SESSION_NAMES: Optional[set] = None
+ACCOUNT_SLOT_BY_KEY: Dict[str, int] = {}
+ACCOUNT_REMOTE_BY_KEY: Dict[str, str] = {}
+_SHARD_RECONCILE_RUNNING = False
+# The home screen is opened frequently. Keep the small global shard summary for
+# a few seconds instead of issuing four MongoDB round trips for every tap.
+_GLOBAL_ACCOUNT_TOTALS_CACHE: Optional[Tuple[float, Tuple[int, int, int, int]]] = None
+GLOBAL_ACCOUNT_TOTALS_CACHE_SECONDS = 5.0
 
 
 # ═══════════════════════ TEXT STYLING ═══════════════════════
@@ -463,30 +576,72 @@ def is_db_locked(err: Exception) -> bool:
     return "database is locked" in msg or "database table is locked" in msg
 
 
+# Telethon generates one exception class per API error code, but ``str()`` of
+# those classes is the *human* sentence, not the code: a deleted account raises
+# UserDeactivatedError whose text is "The user has been deleted/deactivated", a
+# revoked key prints "The key is not registered in the system", and a frozen
+# account prints "You tried to use a method that is not available for frozen
+# accounts". Matching codes such as "USER_DEACTIVATED" or "FROZEN_METHOD_INVALID"
+# against that text therefore never matched anything at all — which is exactly why
+# dead and frozen accounts stayed in the fleet: nothing in the bot could
+# recognise the error, so they were picked for every post, every join and every
+# live, failed quietly and were retried forever.
+#
+# So an error is classified by the *code* it stands for, rebuilt from the
+# exception's class name (UserDeactivatedError -> USER_DEACTIVATED,
+# FrozenMethodInvalidError -> FROZEN_METHOD_INVALID). The raw server message
+# (``err.message``) and the string form are searched too, which covers error
+# codes Telethon has no dedicated class for.
+_CAMEL_BOUNDARY = re.compile(r"(?<!^)(?=[A-Z])")
+
+
+def error_codes(err: BaseException) -> str:
+    """Every identifier this error can be recognised by, upper-cased."""
+    codes = []
+    for cls in type(err).__mro__:
+        name = cls.__name__
+        if name.endswith("Error") and name != "Error":
+            codes.append(_CAMEL_BOUNDARY.sub("_", name[:-len("Error")]).upper())
+    for text in (getattr(err, "message", ""), str(err)):
+        if isinstance(text, str) and text:
+            codes.append(text.upper())
+    return "\n".join(codes)
+
+
+# A login that is gone for good: deleted, banned, key revoked/duplicated or the
+# session terminated. The file can never work again without a fresh login, so
+# the account leaves the pool — the file itself only ever moves to trash, and
+# only when the owner asks for it.
 DEAD_ACCOUNT_MARKERS = (
     "USER_DEACTIVATED", "AUTH_KEY_UNREGISTERED", "SESSION_REVOKED",
-    "USER_DEACTIVATED_BAN", "AUTH_KEY_DUPLICATED", "AUTH_KEY_INVALID",
-    "SESSION_EXPIRED", "PHONE_NUMBER_BANNED",
+    "AUTH_KEY_DUPLICATED", "AUTH_KEY_INVALID", "SESSION_EXPIRED",
+    "PHONE_NUMBER_BANNED",
 )
 
 
+# Frozen (spam-limited) accounts: still authorised, still online, but Telegram
+# refuses almost every method until the freeze is lifted. They must not hold a
+# join/reaction slot, and they must never be treated as dead.
 FROZEN_ACCOUNT_MARKERS = (
-    "FROZEN_METHOD_INVALID", "FROZENMETHODINVALID",
-    "NOT AVAILABLE FOR FROZEN ACCOUNTS",
+    "FROZEN_METHOD_INVALID", "FROZEN_PARTICIPANT_MISSING",
+    "FROZENMETHODINVALID", "NOT AVAILABLE FOR FROZEN ACCOUNTS",
+    "ACCOUNT IS FROZEN",
 )
 
 
 def is_frozen_account_error(err: Exception) -> bool:
     """True when Telegram refused the call because the account is frozen.
 
-    A frozen account is still authorised — get_me() works, it stays connected —
-    but every join/invite method returns FrozenMethodInvalidError. Left in the
-    pool it is picked over and over and every Go Live / client join wastes a
-    slot on it, which is exactly what the log showed. Treat it as unusable for
-    membership work instead, without ever deleting the session.
+    A frozen account is still authorised — it stays connected — but joins,
+    invites and reactions come back as FrozenMethodInvalidError /
+    FrozenParticipantMissingError. Left in the pool it is picked over and over
+    and every Go Live or client join wastes a slot on it. Treat it as unusable
+    for work instead, without ever deleting the session.
     """
-    msg = str(err).upper()
-    return any(m in msg for m in FROZEN_ACCOUNT_MARKERS)
+    if is_db_locked(err):
+        return False
+    hay = error_codes(err)
+    return any(m in hay for m in FROZEN_ACCOUNT_MARKERS)
 
 
 def is_dead_account_error(err: Exception) -> bool:
@@ -497,28 +652,1333 @@ def is_dead_account_error(err: Exception) -> bool:
     """
     if is_db_locked(err):
         return False
-    msg = str(err).upper()
-    return any(m in msg for m in DEAD_ACCOUNT_MARKERS)
+    hay = error_codes(err)
+    return any(m in hay for m in DEAD_ACCOUNT_MARKERS)
 
 
-# ═══════════════════════ MONGODB (clients only) ═══════════════════════
-try:
-    mongo_client = AsyncIOMotorClient(MONGO_URI, serverSelectionTimeoutMS=20000)
-    mdb = mongo_client["tg_manager_bot"]
+def short_error(err: Exception) -> str:
+    """A one-line description of an error, for logs and review screens."""
+    text = str(err).split(" (caused by")[0].strip()
+    return f"{type(err).__name__}: {text}"[:70]
+
+
+# ═══════════════════════ MONGODB / GRIDFS STORAGE ═══════════════════════
+# Motor clients and asyncio primitives must be created inside the same event
+# loop that uses them. Creating AsyncIOMotorClient at module import and then
+# entering asyncio.run(main()) gives Heroku's worker the classic
+# "Future attached to a different loop" failure. Keep these globals lazy and
+# initialise them from main() after the running loop exists.
+mongo_client = None
+mdb = None
+col_history = None
+col_approved = None
+col_clients = None
+col_stats = None
+col_settings = None
+storage_bucket = None
+col_storage = None
+col_account_shards = None
+col_dashboard_tasks = None
+col_dashboard_tokens = None
+col_live_state = None
+storage_lock = None
+
+
+def initialize_mongo_client():
+    """Create Motor/GridFS objects on the current event loop."""
+    global mongo_client, mdb, col_history, col_approved, col_clients
+    global col_stats, col_settings, storage_bucket, col_storage
+    global col_account_shards, col_dashboard_tasks, col_dashboard_tokens
+    global col_live_state, storage_lock
+    if mongo_client is not None:
+        return
+    mongo_client = AsyncIOMotorClient(
+        MONGO_URI,
+        serverSelectionTimeoutMS=20000,
+        connectTimeoutMS=20000,
+        retryWrites=True,
+    )
+    mdb = mongo_client[MONGO_DB_NAME]
     col_history = mdb["history"]
     col_approved = mdb["approved_users"]
     col_clients = mdb["clients"]
     col_stats = mdb["bot_stats"]
     col_settings = mdb["settings"]
-    logger.info("MongoDB client created")
-except Exception as e:
-    logger.error(f"MongoDB error: {e}")
-    sys.exit(1)
+    # GridFS is used instead of a normal document so large audio files are not
+    # limited by MongoDB's 16 MB document limit. Session SQLite files and JSON
+    # sidecars use the same store, which keeps one backup/restore path for all
+    # runtime data.
+    storage_bucket = AsyncIOMotorGridFSBucket(mdb, bucket_name=GRIDFS_BUCKET)
+    col_storage = mdb["storage_manifest"]
+    col_account_shards = mdb["account_shards"]
+    col_dashboard_tasks = mdb["dashboard_tasks"]
+    col_dashboard_tokens = mdb["dashboard_tokens"]
+    col_live_state = mdb["live_state"]
+    storage_lock = asyncio.Lock()
+    logger.info("MongoDB/GridFS client created")
 
 
-# ═══════════════════════ ACCOUNT STORE (sessions folder) ═══════════════════════
+_LOCAL_UPLOAD_FINGERPRINTS: Dict[str, Tuple[int, int]] = {}
+
+
+def _storage_name(kind: str, filename: str) -> str:
+    """Return a safe, stable GridFS/manifest name."""
+    filename = filename.replace("\\", "/").lstrip("/")
+    filename = "/".join(part for part in filename.split("/") if part not in ("", ".", ".."))
+    return f"{kind.strip('/')}/{filename}" if filename else kind.strip("/")
+
+
+def _session_remote_name(session_path: str) -> str:
+    path = os.path.abspath(session_path)
+    for directory, kind in ((SESSIONS_DIR, "sessions"), (TRASH_DIR, "trash")):
+        root = os.path.abspath(directory)
+        try:
+            rel = os.path.relpath(path, root)
+        except ValueError:
+            rel = ".."
+        if rel != ".." and not rel.startswith(".." + os.sep):
+            return _storage_name(kind, rel)
+    return _storage_name("sessions", os.path.basename(path))
+
+
+def _bot_remote_name(path: str) -> str:
+    return _storage_name("bot", os.path.basename(path))
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+async def _storage_manifest(name: str) -> Optional[dict]:
+    if col_storage is None:
+        return None
+    return await col_storage.find_one({"_id": name})
+
+
+async def storage_put_path(name: str, path: str, kind: str = "runtime",
+                           force: bool = False) -> bool:
+    """Upload a local file to GridFS and atomically update its manifest."""
+    if storage_bucket is None or col_storage is None or not os.path.exists(path):
+        return False
+    stat = await asyncio.to_thread(os.stat, path)
+    fingerprint = (stat.st_size, stat.st_mtime_ns)
+    manifest = await _storage_manifest(name)
+    if not force and _LOCAL_UPLOAD_FINGERPRINTS.get(name) == fingerprint and manifest:
+        return False
+    digest = await asyncio.to_thread(_sha256_file, path)
+    if not force and manifest and manifest.get("sha256") == digest:
+        _LOCAL_UPLOAD_FINGERPRINTS[name] = fingerprint
+        return False
+
+    async with storage_lock:
+        # Re-check after waiting so two callbacks cannot upload two copies of
+        # the same session at once.
+        manifest = await _storage_manifest(name)
+        if not force and manifest and manifest.get("sha256") == digest:
+            _LOCAL_UPLOAD_FINGERPRINTS[name] = fingerprint
+            return False
+        with open(path, "rb") as source:
+            file_id = await storage_bucket.upload_from_stream(
+                name,
+                source,
+                metadata={"kind": kind, "sha256": digest, "size": stat.st_size},
+            )
+        document = {
+            "_id": name,
+            "gridfs_id": file_id,
+            "kind": kind,
+            "sha256": digest,
+            "size": stat.st_size,
+            "updated_at": utcnow(),
+        }
+        await col_storage.replace_one({"_id": name}, document, upsert=True)
+        old_id = manifest.get("gridfs_id") if manifest else None
+        if old_id and old_id != file_id:
+            try:
+                await storage_bucket.delete(old_id)
+            except Exception:
+                logger.debug("could not remove old GridFS version for %s", name)
+    _LOCAL_UPLOAD_FINGERPRINTS[name] = fingerprint
+    return True
+
+
+async def storage_put_bytes(name: str, data: bytes, kind: str = "runtime") -> bool:
+    """Store a small object (sessions/trash metadata) without a temp file."""
+    if storage_bucket is None or col_storage is None:
+        return False
+    digest = hashlib.sha256(data).hexdigest()
+    manifest = await _storage_manifest(name)
+    if manifest and manifest.get("sha256") == digest:
+        return False
+    async with storage_lock:
+        manifest = await _storage_manifest(name)
+        if manifest and manifest.get("sha256") == digest:
+            return False
+        file_id = await storage_bucket.upload_from_stream(
+            name, io.BytesIO(data),
+            metadata={"kind": kind, "sha256": digest, "size": len(data)},
+        )
+        await col_storage.replace_one(
+            {"_id": name},
+            {"_id": name, "gridfs_id": file_id, "kind": kind,
+             "sha256": digest, "size": len(data), "updated_at": utcnow()},
+            upsert=True,
+        )
+        old_id = manifest.get("gridfs_id") if manifest else None
+        if old_id and old_id != file_id:
+            try:
+                await storage_bucket.delete(old_id)
+            except Exception:
+                logger.debug("could not remove old GridFS version for %s", name)
+    return True
+
+
+async def storage_get_bytes(name: str) -> Optional[bytes]:
+    if storage_bucket is None:
+        return None
+    last_error = None
+    for attempt in range(3):
+        manifest = await _storage_manifest(name)
+        if not manifest:
+            return None
+        output = io.BytesIO()
+        try:
+            await storage_bucket.download_to_stream(manifest["gridfs_id"], output)
+            return output.getvalue()
+        except Exception as exc:
+            last_error = exc
+            if attempt < 2:
+                await asyncio.sleep(0.5 * (attempt + 1))
+    logger.warning("GridFS download failed for %s: %s", name, last_error)
+    return None
+
+
+async def storage_download_path(name: str, path: str, force: bool = True) -> bool:
+    """Materialise a GridFS object into a local working path atomically."""
+    if storage_bucket is None:
+        return False
+    if not force and os.path.exists(path):
+        return True
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    partial = path + ".part"
+    last_error = None
+    for attempt in range(3):
+        manifest = await _storage_manifest(name)
+        if not manifest:
+            return False
+        try:
+            with open(partial, "wb") as destination:
+                await storage_bucket.download_to_stream(manifest["gridfs_id"], destination)
+            os.replace(partial, path)
+            stat = os.stat(path)
+            _LOCAL_UPLOAD_FINGERPRINTS[name] = (stat.st_size, stat.st_mtime_ns)
+            return True
+        except Exception as exc:
+            last_error = exc
+            try:
+                os.unlink(partial)
+            except FileNotFoundError:
+                pass
+            if attempt < 2:
+                # A concurrent GridFS manifest replacement can briefly expose
+                # the old file id; re-read the manifest before declaring loss.
+                await asyncio.sleep(0.5 * (attempt + 1))
+    logger.warning("GridFS restore failed for %s: %s", name, last_error)
+    return False
+
+
+async def storage_delete(name: str) -> bool:
+    if storage_bucket is None or col_storage is None:
+        return False
+    async with storage_lock:
+        manifest = await _storage_manifest(name)
+        if not manifest:
+            return False
+        try:
+            await storage_bucket.delete(manifest["gridfs_id"])
+        except Exception:
+            pass
+        await col_storage.delete_one({"_id": name})
+    _LOCAL_UPLOAD_FINGERPRINTS.pop(name, None)
+    return True
+
+
+async def move_problem_session_storage_to_trash(stems: List[str]) -> dict:
+    """Move only the listed problem sessions to MongoDB/GridFS trash.
+
+    GridFS has no rename operation, but its chunks are independent of the
+    filename. Updating the GridFS filenames and replacing the small manifest
+    documents lets this bulk action move hundreds of sessions without copying
+    their bytes or touching healthy accounts.
+    """
+    if mdb is None or col_storage is None or storage_lock is None:
+        return {"entries": 0, "files": 0, "bytes": 0}
+
+    stems = list(dict.fromkeys(stems))
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    extensions = (".session", ".json", ".session-journal",
+                  ".session-wal", ".session-shm")
+    source_to_destination = {}
+    for stem in stems:
+        for ext in extensions:
+            source = f"sessions/{stem}{ext}"
+            destination = f"trash/{stem}_{stamp}{ext}"
+            source_to_destination[source] = destination
+
+    async with storage_lock:
+        source_names = list(source_to_destination)
+        docs = await col_storage.find(
+            {"_id": {"$in": source_names}},
+            {"_id": 1, "gridfs_id": 1, "size": 1, "kind": 1},
+        ).to_list(length=None)
+        file_ops = []
+        manifest_docs = []
+        for doc in docs:
+            source = doc["_id"]
+            destination = source_to_destination[source]
+            if doc.get("gridfs_id"):
+                file_ops.append(UpdateOne(
+                    {"_id": doc["gridfs_id"]},
+                    {"$set": {"filename": destination}},
+                ))
+            moved_doc = dict(doc)
+            moved_doc["_id"] = destination
+            moved_doc["kind"] = "trash"
+            moved_doc["updated_at"] = utcnow()
+            manifest_docs.append(moved_doc)
+
+        if file_ops:
+            await mdb[f"{GRIDFS_BUCKET}.files"].bulk_write(
+                file_ops, ordered=False)
+        if manifest_docs:
+            await col_storage.bulk_write(
+                [InsertOne(doc) for doc in manifest_docs], ordered=False)
+            await col_storage.delete_many(
+                {"_id": {"$in": [doc["_id"] for doc in docs]}})
+
+    # Move the disposable local mirror using the same timestamped names.
+    moved_local = 0
+    for source, destination in source_to_destination.items():
+        source_path = os.path.join(SESSIONS_DIR, source[len("sessions/"):])
+        destination_path = os.path.join(TRASH_DIR, destination[len("trash/"):])
+        if not os.path.exists(source_path):
+            continue
+        os.makedirs(os.path.dirname(destination_path), exist_ok=True)
+        try:
+            os.replace(source_path, destination_path)
+            moved_local += 1
+        except OSError as exc:
+            logger.warning("problem session trash move %s: %s", source_path, exc)
+    _LOCAL_UPLOAD_FINGERPRINTS.clear()
+    return {
+        "entries": len(stems),
+        "files": len(docs),
+        "bytes": sum(int(doc.get("size", 0) or 0) for doc in docs),
+        "local_files": moved_local,
+    }
+
+
+async def storage_move(source_name: str, destination_name: str,
+                       kind: str = "session") -> bool:
+    data = await storage_get_bytes(source_name)
+    if data is None:
+        return False
+    if not await storage_put_bytes(destination_name, data, kind=kind):
+        # An identical destination is still a successful copy; only the delete
+        # below is needed to complete the move.
+        if not await _storage_manifest(destination_name):
+            return False
+    await storage_delete(source_name)
+    return True
+
+
+async def persist_session_bundle(session_path: str):
+    """Persist the SQLite session and its device/API sidecar together."""
+    await storage_put_path(_session_remote_name(session_path), session_path, "session")
+    sidecar = meta_path(session_path)
+    if os.path.exists(sidecar):
+        await storage_put_path(_session_remote_name(sidecar), sidecar, "session_meta")
+
+
+def worker_owns_runtime_object(name: str) -> bool:
+    """Whether this dyno may materialise a remote runtime object."""
+    if not sharding_runtime_enabled() or WORKER_SESSION_NAMES is None:
+        return True
+    if name.startswith("sessions/"):
+        filename = name[len("sessions/"):]
+        if filename.endswith(".session"):
+            session_name = name
+        elif ".session" in filename:
+            session_name = "sessions/" + filename.split(".session", 1)[0] + ".session"
+        elif filename.endswith(".json"):
+            session_name = "sessions/" + filename[:-len(".json")] + ".session"
+        else:
+            return False
+        return session_name in WORKER_SESSION_NAMES
+    # Only the controller needs trash files for its admin screen. The bot uses
+    # MemorySession, so account workers do not need the old bot SQLite copy.
+    if name.startswith("trash/") or name.startswith("bot/"):
+        return IS_CONTROLLER_WORKER
+    return True
+
+
+async def restore_runtime_storage(force: bool = True):
+    """Restore runtime objects into the working tree.
+
+    Startup uses ``force=True`` because the tree is empty. Reconciliation must
+    use ``force=False``: replacing an open Telethon SQLite file creates the
+    readonly/unlinked-inode errors seen when a worker reshards live accounts.
+    """
+    if col_storage is None:
+        return
+    docs = []
+    async for document in col_storage.find({
+        "kind": {"$in": ["session", "session_meta", "trash", "audio", "bot_session"]}
+    }):
+        docs.append(document)
+
+    async def restore(document):
+        name = document["_id"]
+        if not worker_owns_runtime_object(name):
+            return
+        if name.startswith("sessions/"):
+            target = os.path.join(SESSIONS_DIR, name[len("sessions/"):])
+        elif name.startswith("trash/"):
+            target = os.path.join(TRASH_DIR, name[len("trash/"):])
+        elif name == "audio/live.mp3":
+            target = LIVE_AUDIO_PATH
+        elif name.startswith("bot/"):
+            target = os.path.join(RUNTIME_ROOT, name[len("bot/"):])
+        else:
+            return
+        await storage_download_path(name, target, force=force)
+
+    sem = asyncio.Semaphore(6)
+
+    async def limited(document):
+        async with sem:
+            await restore(document)
+
+    await asyncio.gather(*(limited(document) for document in docs))
+    logger.info("Restored %d runtime object(s) from MongoDB/GridFS", len(docs))
+
+
+async def migrate_legacy_storage_if_needed():
+    """Import old VPS files once, without overwriting a newer Mongo copy."""
+    if col_storage is None:
+        return
+
+    async def import_if_missing(name: str, path: str, kind: str):
+        if os.path.isfile(path) and not await _storage_manifest(name):
+            await storage_put_path(name, path, kind=kind, force=True)
+            logger.info("Migrated legacy file %s -> MongoDB", path)
+
+    if os.path.isdir(LEGACY_SESSIONS_DIR):
+        for root, _dirs, files in os.walk(LEGACY_SESSIONS_DIR):
+            for filename in files:
+                if not filename.endswith((".session", ".json", ".txt", ".imported")):
+                    continue
+                path = os.path.join(root, filename)
+                rel = os.path.relpath(path, LEGACY_SESSIONS_DIR)
+                await import_if_missing(_storage_name("sessions", rel), path, "session")
+    if os.path.isdir(LEGACY_TRASH_DIR):
+        for root, _dirs, files in os.walk(LEGACY_TRASH_DIR):
+            for filename in files:
+                path = os.path.join(root, filename)
+                rel = os.path.relpath(path, LEGACY_TRASH_DIR)
+                await import_if_missing(_storage_name("trash", rel), path, "trash")
+    await import_if_missing("audio/live.mp3", LEGACY_AUDIO_PATH, "audio")
+    for suffix in (".session", ".session-journal", ".session-wal", ".session-shm"):
+        await import_if_missing(_bot_remote_name("bot_session" + suffix),
+                                LEGACY_BOT_SESSION_BASE + suffix, "bot_session")
+
+
+async def sync_runtime_storage():
+    """Push changed working files to MongoDB; safe to run periodically."""
+    if col_storage is None:
+        return
+    paths = []
+    for directory, kind in ((SESSIONS_DIR, "session"), (TRASH_DIR, "trash")):
+        for root, _dirs, files in os.walk(directory):
+            for filename in files:
+                if filename.endswith((".session", ".json")):
+                    paths.append((_storage_name("sessions" if kind == "session" else "trash",
+                                                os.path.relpath(os.path.join(root, filename), directory)),
+                                  os.path.join(root, filename), kind))
+    if os.path.exists(LIVE_AUDIO_PATH):
+        paths.append(("audio/live.mp3", LIVE_AUDIO_PATH, "audio"))
+    for suffix in (".session", ".session-journal", ".session-wal", ".session-shm"):
+        path = BOT_SESSION_BASE + suffix
+        if os.path.exists(path):
+            paths.append((_bot_remote_name("bot_session" + suffix), path, "bot_session"))
+    for name, path, kind in paths:
+        try:
+            await storage_put_path(name, path, kind=kind)
+        except Exception as exc:
+            logger.warning("Runtime storage sync failed for %s: %s", name, exc)
+
+
+async def runtime_storage_task():
+    while True:
+        await asyncio.sleep(STORAGE_SYNC_INTERVAL)
+        try:
+            await sync_runtime_storage()
+        except Exception as exc:
+            logger.error("runtime storage sweep: %s", exc)
+
+
+async def ensure_database_indexes():
+    """Keep the MongoDB collections used by the bot queryable after migration."""
+    await col_clients.create_index([("client_user_id", 1), ("status", 1)])
+    await col_clients.create_index([("channel_id", 1), ("status", 1), ("expires_at", 1)])
+    await col_history.create_index([("timestamp", -1)])
+    await col_approved.create_index("user_id")
+    await col_storage.create_index("gridfs_id")
+    await col_account_shards.create_index([("slot", 1), ("owner", 1)])
+    await col_account_shards.create_index("account_key")
+    await col_dashboard_tasks.create_index([
+        ("kind", 1), ("worker_slot", 1), ("status", 1), ("created_at", 1)
+    ])
+    await col_dashboard_tasks.create_index("parent_id")
+    await col_dashboard_tokens.create_index("expires_at", expireAfterSeconds=0)
+
+
+_LAST_HEROKU_WORKER_TARGET: Optional[int] = None
+_LAST_HEROKU_WORKER_CHECK = 0.0
+HEROKU_FORMATION_RECHECK_SECONDS = 300.0
+
+
+def sharding_runtime_enabled() -> bool:
+    """Enable account sharding on Heroku dynos, not on the old single VPS."""
+    return ACCOUNT_SHARDING and bool(DYNO_NAME)
+
+
+async def heroku_scale_workers(quantity: int):
+    """Ask the Heroku Formation API for the required worker count.
+
+    The API key is optional. Without it the app remains safe and logs the
+    manual scale command instead of failing startup. Formation drift is checked
+    periodically, not on every 60-second shard tick, so an idle bot does not
+    spend a network request on the Heroku control plane every minute.
+    """
+    global _LAST_HEROKU_WORKER_TARGET, _LAST_HEROKU_WORKER_CHECK
+    quantity = max(1, int(quantity))
+    if not IS_CONTROLLER_WORKER:
+        return
+    now_mono = time.monotonic()
+    if (_LAST_HEROKU_WORKER_TARGET == quantity
+            and now_mono - _LAST_HEROKU_WORKER_CHECK < HEROKU_FORMATION_RECHECK_SECONDS):
+        return
+    # A changed session count is applied immediately. If an operator manually
+    # changes formation, the same target is corrected on the five-minute check.
+    if not HEROKU_APP_NAME or not HEROKU_API_KEY:
+        logger.warning(
+            "Account sharding needs %s worker(s). Set HEROKU_APP_NAME and "
+            "HEROKU_API_KEY for automatic scaling; manual command: "
+            "heroku ps:scale worker=%s",
+            quantity, quantity,
+        )
+        _LAST_HEROKU_WORKER_TARGET = quantity
+        _LAST_HEROKU_WORKER_CHECK = now_mono
+        return
+
+    def patch_formation():
+        url = f"https://api.heroku.com/apps/{HEROKU_APP_NAME}/formation/worker"
+        body = json.dumps({"quantity": quantity}).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=body,
+            method="PATCH",
+            headers={
+                "Authorization": f"Bearer {HEROKU_API_KEY}",
+                "Accept": "application/vnd.heroku+json; version=3",
+                "Content-Type": "application/json",
+            },
+        )
+        with urllib.request.urlopen(request, timeout=20) as response:
+            return response.status
+
+    try:
+        status = await asyncio.to_thread(patch_formation)
+        _LAST_HEROKU_WORKER_TARGET = quantity
+        _LAST_HEROKU_WORKER_CHECK = time.monotonic()
+        logger.info("Heroku formation requested: worker=%s (HTTP %s)",
+                    quantity, status)
+    except Exception as exc:
+        _LAST_HEROKU_WORKER_CHECK = time.monotonic()
+        logger.error("Heroku auto-scale to worker=%s failed: %s", quantity, exc)
+
+
+async def _infer_account_key(session_name: str) -> str:
+    """Read a stable account key from the JSON sidecar without opening Telegram."""
+    stem = session_name[len("sessions/"):-len(".session")]
+    try:
+        raw = await storage_get_bytes(session_name[:-len(".session")] + ".json")
+        if raw:
+            meta = json.loads(raw.decode("utf-8"))
+            phone = str(meta_get(meta, "phone") or "").strip()
+            if phone:
+                return phone if phone.startswith("+") else f"+{phone}"
+            user_id = meta_get(meta, "user_id")
+            if user_id:
+                return f"id_{user_id}"
+    except Exception:
+        pass
+    return stem
+
+
+async def _claim_worker_shards(assigned: set, now: datetime.datetime) -> set:
+    """Claim this dyno's assigned sessions without opening their SQLite files."""
+    await col_account_shards.update_many(
+        {"owner": WORKER_INSTANCE_ID,
+         "_id": {"$nin": list(assigned)} if assigned else {"$exists": True}},
+        {"$set": {"owner": None, "lease_until": None}},
+    )
+
+    claimed = set()
+    for name in assigned:
+        # The update is deliberately conditional: an old dyno may still own a
+        # file during a rolling replacement, and the handoff window prevents two
+        # Telethon processes from opening the same SQLite inode.
+        query = {
+            "_id": name,
+            "slot": WORKER_SLOT,
+            "$or": [
+                {"owner": {"$exists": False}},
+                {"owner": None},
+                {"owner": WORKER_INSTANCE_ID},
+                {"$and": [
+                    {"lease_until": {"$lt": now}},
+                    {"$or": [
+                        {"handoff_until": {"$exists": False}},
+                        {"handoff_until": {"$lte": now}},
+                    ]},
+                ]},
+            ],
+        }
+        result = await col_account_shards.update_one(
+            query,
+            {"$set": {"owner": WORKER_INSTANCE_ID,
+                      "lease_until": now + datetime.timedelta(seconds=SHARD_LEASE_SECONDS)}},
+        )
+        if result.matched_count:
+            claimed.add(name)
+    return claimed
+
+
+async def reconcile_account_shards() -> set:
+    """Keep the shard map current while avoiding a GridFS scan on every worker.
+
+    Only the controller recalculates assignments. Other workers already know
+    their slot from ``account_shards`` and only refresh their lease. The old
+    implementation made every worker download every account's JSON sidecar on
+    every reconcile tick; with a large fleet that saturated MongoDB and delayed
+    Telegram updates by the database server-selection timeout.
+    """
+    global WORKER_SESSION_NAMES, ACCOUNT_SLOT_BY_KEY, ACCOUNT_REMOTE_BY_KEY
+    global _SHARD_RECONCILE_RUNNING
+    if not sharding_runtime_enabled() or col_account_shards is None:
+        WORKER_SESSION_NAMES = None
+        return set()
+    if _SHARD_RECONCILE_RUNNING:
+        return set(WORKER_SESSION_NAMES or set())
+
+    _SHARD_RECONCILE_RUNNING = True
+    try:
+        now = utcnow()
+
+        if not IS_CONTROLLER_WORKER:
+            # A non-controller never needs GridFS sidecars or the complete
+            # storage manifest. The lightweight shard map is enough to build
+            # global account ordering and claim this worker's ten sessions.
+            shard_docs = await col_account_shards.find(
+                {}, {"_id": 1, "account_key": 1, "slot": 1}
+            ).to_list(length=None)
+            slot_by_name = {}
+            key_by_name = {}
+            for doc in shard_docs:
+                name = doc.get("_id")
+                if not name:
+                    continue
+                try:
+                    slot = int(doc.get("slot", -1))
+                except (TypeError, ValueError):
+                    slot = -1
+                slot_by_name[name] = slot
+                key = str(doc.get("account_key") or "").strip()
+                if key:
+                    key_by_name[name] = key
+
+            assigned = {name for name, slot in slot_by_name.items()
+                        if slot == WORKER_SLOT}
+            claimed = await _claim_worker_shards(assigned, now)
+            ACCOUNT_SLOT_BY_KEY = {
+                key_by_name[name]: slot_by_name[name]
+                for name in key_by_name
+                if name in slot_by_name and slot_by_name[name] >= 0
+            }
+            ACCOUNT_REMOTE_BY_KEY = {
+                key_by_name[name]: name for name in key_by_name
+                if name in slot_by_name and slot_by_name[name] >= 0
+            }
+            WORKER_SESSION_NAMES = claimed
+            desired_workers = max(
+                1,
+                max(slot_by_name.values(), default=-1) + 1,
+                ceil(len(slot_by_name) / ACCOUNT_SHARD_SIZE),
+            )
+            logger.info("Worker %s owns %s/%s session shard(s); formation target=%s",
+                        WORKER_INSTANCE_ID, len(claimed), len(slot_by_name),
+                        desired_workers)
+            return claimed
+
+        if col_storage is None:
+            WORKER_SESSION_NAMES = set()
+            return set()
+
+        # Controller-only assignment pass. This is one manifest query plus one
+        # small shard-map query; GridFS is touched only for new shard rows that
+        # do not yet have an account_key.
+        session_docs = await col_storage.find(
+            {"_id": {"$regex": r"^sessions/.*\.session$"}},
+            {"_id": 1},
+        ).sort("_id", 1).to_list(length=None)
+        names = [doc["_id"] for doc in session_docs]
+        desired_workers = max(1, ceil(len(names) / ACCOUNT_SHARD_SIZE))
+        await heroku_scale_workers(desired_workers)
+
+        existing_docs = await col_account_shards.find(
+            {"_id": {"$in": names}},
+            {"_id": 1, "slot": 1, "account_key": 1, "owner": 1,
+             "lease_until": 1, "handoff_until": 1},
+        ).to_list(length=None) if names else []
+        existing = {doc["_id"]: doc for doc in existing_docs}
+
+        key_by_name = {
+            name: str(doc.get("account_key") or "").strip()
+            for name, doc in existing.items()
+            if str(doc.get("account_key") or "").strip()
+        }
+        missing_names = [name for name in names if name not in key_by_name]
+        if missing_names:
+            sem = asyncio.Semaphore(20)
+
+            async def key_for(name):
+                async with sem:
+                    return name, await _infer_account_key(name)
+
+            for name, key in await asyncio.gather(
+                *(key_for(name) for name in missing_names)
+            ):
+                key_by_name[name] = key
+
+        counts = [0] * desired_workers
+        assignments = {}
+        for name in names:
+            old = existing.get(name, {})
+            try:
+                old_slot = int(old.get("slot"))
+            except (TypeError, ValueError):
+                old_slot = -1
+            if (0 <= old_slot < desired_workers
+                    and counts[old_slot] < ACCOUNT_SHARD_SIZE):
+                slot = old_slot
+            else:
+                available = [i for i, count in enumerate(counts)
+                             if count < ACCOUNT_SHARD_SIZE]
+                slot = (min(available, key=lambda i: counts[i])
+                        if available else desired_workers - 1)
+            counts[slot] += 1
+            assignments[name] = slot
+
+        writes = []
+        for name, slot in assignments.items():
+            old = existing.get(name, {})
+            key = key_by_name[name]
+            if old.get("slot") == slot and str(old.get("account_key") or "") == key:
+                continue
+            fields = {"slot": slot, "account_key": key, "updated_at": now}
+            if old.get("slot") != slot:
+                # Give an old worker time to release its SQLite connection
+                # before another slot materialises the same session.
+                fields["handoff_until"] = now + datetime.timedelta(seconds=30)
+            writes.append(UpdateOne({"_id": name}, {"$set": fields}, upsert=True))
+        if writes:
+            await col_account_shards.bulk_write(writes, ordered=False)
+
+        assigned = {name for name, slot in assignments.items()
+                    if slot == WORKER_SLOT}
+        claimed = await _claim_worker_shards(assigned, now)
+        ACCOUNT_SLOT_BY_KEY = {
+            key_by_name[name]: assignments[name]
+            for name in names if name in assignments
+        }
+        ACCOUNT_REMOTE_BY_KEY = {
+            key_by_name[name]: name for name in names if name in assignments
+        }
+        WORKER_SESSION_NAMES = claimed
+        logger.info("Worker %s owns %s/%s session shard(s); formation target=%s",
+                    WORKER_INSTANCE_ID, len(claimed), len(names), desired_workers)
+        return claimed
+    finally:
+        _SHARD_RECONCILE_RUNNING = False
+
+
+async def prune_local_sessions_not_owned():
+    if not sharding_runtime_enabled() or WORKER_SESSION_NAMES is None:
+        return
+    for filename in os.listdir(SESSIONS_DIR):
+        if not filename.endswith(".session"):
+            continue
+        remote = _storage_name("sessions", filename)
+        if remote in WORKER_SESSION_NAMES:
+            continue
+        stem = os.path.splitext(filename)[0]
+        for local in (os.path.join(SESSIONS_DIR, filename),
+                      os.path.join(SESSIONS_DIR, stem + ".json"),
+                      os.path.join(SESSIONS_DIR, stem + ".session-journal"),
+                      os.path.join(SESSIONS_DIR, stem + ".session-wal"),
+                      os.path.join(SESSIONS_DIR, stem + ".session-shm")):
+            try:
+                os.unlink(local)
+            except FileNotFoundError:
+                pass
+
+
+async def release_worker_shards():
+    if not sharding_runtime_enabled() or col_account_shards is None:
+        return
+    await col_account_shards.update_many(
+        {"owner": WORKER_INSTANCE_ID},
+        {"$set": {"owner": None, "lease_until": None}},
+    )
+
+
+async def worker_shard_reconcile_task():
+    """Refresh leases and pick up accounts added through the controller worker."""
+    while True:
+        await asyncio.sleep(WORKER_RECONCILE_INTERVAL)
+        if not sharding_runtime_enabled():
+            continue
+        try:
+            before = set(WORKER_SESSION_NAMES or set())
+            after = await reconcile_account_shards()
+            if after != before:
+                await restore_runtime_storage(force=False)
+                # Disconnect sessions that moved away from this slot.
+                allowed_stems = {os.path.splitext(os.path.basename(n))[0] for n in after}
+                for key, account in list(ACCOUNTS.items()):
+                    if account.stem not in allowed_stems:
+                        await disconnect_account(key)
+                        ACCOUNTS.pop(key, None)
+                await prune_local_sessions_not_owned()
+                # Probe only newly claimed local files, not all ten on every tick.
+                loaded_stems = {a.stem for a in ACCOUNTS.values()}
+                for name in after:
+                    stem = os.path.splitext(os.path.basename(name))[0]
+                    if stem not in loaded_stems:
+                        path = os.path.join(SESSIONS_DIR, f"{stem}.session")
+                        if os.path.exists(path):
+                            await probe_and_register(path)
+                await setup_channel_monitors()
+            else:
+                await col_account_shards.update_many(
+                    {"owner": WORKER_INSTANCE_ID},
+                    {"$set": {"lease_until": utcnow() + datetime.timedelta(seconds=SHARD_LEASE_SECONDS)}},
+                )
+        except Exception as exc:
+            logger.error("worker shard reconcile: %s", exc)
+
+
+async def enqueue_internal_worker_fanout(action: str, params: Optional[dict] = None):
+    if col_dashboard_tasks is None:
+        return None
+    slots = [0]
+    if col_account_shards is not None:
+        docs = await col_account_shards.find({}, {"slot": 1}).to_list(length=None)
+        slots = sorted(set(int(d.get("slot", 0) or 0) for d in docs)) or [0]
+    parent_id = ObjectId()
+    await col_dashboard_tasks.insert_one({
+        "_id": parent_id, "kind": "parent", "action": action,
+        "params": params or {}, "status": "queued", "created_at": utcnow(),
+    })
+    await col_dashboard_tasks.insert_many([{
+        "_id": ObjectId(), "kind": "child", "parent_id": parent_id,
+        "action": action, "params": params or {}, "worker_slot": slot,
+        "status": "queued", "created_at": utcnow(),
+    } for slot in slots])
+    return parent_id
+
+
+async def _dashboard_join_local(params: dict) -> dict:
+    link = str(params.get("target", "")).strip()
+    ltype, target = parse_target(link)
+    if ltype not in ("public", "private"):
+        return {"ok": 0, "failed": len(acc_keys()), "error": "invalid channel link"}
+    keys = worker_task_keys(int(params.get("limit", 0) or 0))
+    successful = []
+    result = {"ok": 0, "failed": 0}
+    sem = asyncio.Semaphore(JOIN_CONCURRENCY)
+
+    async def one(key):
+        async with sem:
+            client = acc_client(key)
+            try:
+                if ltype == "public":
+                    await client(JoinChannelRequest(target))
+                else:
+                    await client(ImportChatInviteRequest(target))
+                result["ok"] += 1
+                successful.append(key)
+                await log_activity(key, "DASHBOARD_JOIN", link, "Success")
+            except UserAlreadyParticipantError:
+                result["ok"] += 1
+                successful.append(key)
+            except Exception as exc:
+                result["failed"] += 1
+                await log_activity(key, "DASHBOARD_JOIN", link, str(exc)[:80])
+
+    await asyncio.gather(*(one(key) for key in keys))
+    client_id = str(params.get("client_id", "")).strip()
+    if client_id and successful:
+        try:
+            await col_clients.update_one(
+                {"_id": ObjectId(client_id)},
+                {"$addToSet": {"joined_accounts": {"$each": successful}},
+                 "$set": {"updated_at": utcnow()}},
+            )
+        except Exception as exc:
+            logger.warning("dashboard client membership save failed: %s", exc)
+    return result
+
+
+async def _dashboard_leave_local(params: dict) -> dict:
+    link = str(params.get("target", "")).strip()
+    ltype, target = parse_target(link)
+    if not ltype:
+        return {"ok": 0, "failed": len(acc_keys()), "error": "invalid channel link"}
+    result = {"ok": 0, "failed": 0}
+    for key in worker_task_keys(int(params.get("limit", 0) or 0)):
+        client = acc_client(key)
+        try:
+            if ltype == "public":
+
+                await client(LeaveChannelRequest(target))
+            else:
+                entity = await client.get_entity(link)
+                await client.delete_dialog(entity)
+            result["ok"] += 1
+        except Exception:
+            result["failed"] += 1
+        await asyncio.sleep(0.05)
+    invalidate_peer_cache()
+    return result
+
+
+async def _dashboard_leave_all_local(params: dict) -> dict:
+    """Leave every channel/group from only this worker's shard."""
+    result = {"ok": 0, "failed": 0}
+    keys = worker_task_keys()
+    for key in keys:
+        client = acc_client(key)
+        if not client:
+            continue
+        try:
+            async for dialog in client.iter_dialogs():
+                if not (dialog.is_channel or dialog.is_group):
+                    continue
+                try:
+                    await client.delete_dialog(dialog.entity)
+                    result["ok"] += 1
+                except Exception:
+                    result["failed"] += 1
+                await asyncio.sleep(0.3)
+        except Exception:
+            result["failed"] += 1
+    invalidate_peer_cache()
+    return result
+
+
+async def _dashboard_react_local(params: dict) -> dict:
+    link = str(params.get("target", "")).strip()
+    spec, message_id = parse_post_link(link)
+    if spec is None:
+        return {"ok": 0, "failed": len(acc_keys()), "error": "invalid post link"}
+    emojis = params.get("emojis") or [str(params.get("emoji", "")).strip() or random.choice(REACTION_EMOJIS)]
+    if isinstance(emojis, str):
+        emojis = [emojis]
+    result = {"ok": 0, "failed": 0}
+    for key in worker_task_keys(int(params.get("limit", 0) or 0)):
+        client = acc_client(key)
+        try:
+            peer = await resolve_peer(key, client, spec)
+            if peer is None:
+                result["failed"] += 1
+                continue
+            for emoji in emojis:
+                ok, _err = await send_reaction(client, peer, message_id, emoji)
+                result["ok" if ok else "failed"] += 1
+        except Exception:
+            result["failed"] += 1
+        await asyncio.sleep(0.05)
+    await increment_stats(reactions=result["ok"])
+    return result
+
+
+async def _dashboard_views_local(params: dict) -> dict:
+    link = str(params.get("target", "")).strip()
+    spec, message_id = parse_post_link(link)
+    if spec is None:
+        return {"ok": 0, "failed": len(acc_keys()), "error": "invalid post link"}
+    result = {"ok": 0, "failed": 0}
+    for key in worker_task_keys(int(params.get("limit", 0) or 0)):
+        client = acc_client(key)
+        try:
+            peer = await resolve_peer(key, client, spec)
+            if peer is None:
+                result["failed"] += 1
+                continue
+            ok, _err = await send_views(client, peer, [message_id])
+            result["ok" if ok else "failed"] += 1
+        except Exception:
+            result["failed"] += 1
+        await asyncio.sleep(0.05)
+    await increment_stats(views=result["ok"])
+    return result
+
+
+async def _dashboard_set_name_local(params: dict) -> dict:
+    name = str(params.get("name", "")).strip()
+    if not name:
+        return {"ok": 0, "failed": len(acc_keys()), "error": "name is empty"}
+    parts = name.split(None, 1)
+    result = {"ok": 0, "failed": 0}
+    for key in worker_task_keys(int(params.get("limit", 0) or 0)):
+        try:
+            await acc_client(key)(UpdateProfileRequest(
+                first_name=parts[0], last_name=parts[1] if len(parts) > 1 else ""))
+            ACCOUNTS[key].name = parts[0]
+            result["ok"] += 1
+        except Exception:
+            result["failed"] += 1
+    return result
+
+
+async def _dashboard_random_names_local(params: dict) -> dict:
+    names = [x.strip() for x in str(params.get("names", "")).replace("\\n", ",").split(",") if x.strip()]
+    if not names:
+        names = list(INDIAN_RANDOM_NAMES)
+    if not names:
+        return {"ok": 0, "failed": len(acc_keys()), "error": "names are empty"}
+    result = {"ok": 0, "failed": 0}
+    for key in worker_task_keys(int(params.get("limit", 0) or 0)):
+        try:
+            name = random.choice(names)
+            parts = name.split(None, 1)
+            await acc_client(key)(UpdateProfileRequest(
+                first_name=parts[0], last_name=parts[1] if len(parts) > 1 else ""))
+            ACCOUNTS[key].name = parts[0]
+            result["ok"] += 1
+        except Exception:
+            result["failed"] += 1
+    return result
+
+
+async def _dashboard_profile_photo_local(params: dict) -> dict:
+    remote_name = str(params.get("file_name", "")).strip()
+    if not remote_name:
+        return {"ok": 0, "failed": len(acc_keys()), "error": "photo upload missing"}
+    path = os.path.join(tempfile.gettempdir(), "dashboard-profile-" + secrets.token_hex(8) + ".jpg")
+    if not await storage_download_path(remote_name, path):
+        return {"ok": 0, "failed": len(acc_keys()), "error": "photo upload unavailable"}
+    result = {"ok": 0, "failed": 0}
+    try:
+        for key in worker_task_keys(int(params.get("limit", 0) or 0)):
+            try:
+                uploaded = await acc_client(key).upload_file(path)
+                await acc_client(key)(UploadProfilePhotoRequest(file=uploaded))
+                result["ok"] += 1
+            except Exception:
+                result["failed"] += 1
+    finally:
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+    return result
+
+
+async def _dashboard_session_import_local(params: dict) -> dict:
+    """Import a dashboard ZIP through the controller worker without opening all
+    sessions there. Files are persisted first; shard workers probe their own
+    ten-account slice on the next reconciliation.
+    """
+    remote_name = str(params.get("file_name", "")).strip()
+    if not remote_name:
+        return {"ok": 0, "failed": 1, "error": "ZIP upload missing"}
+    raw = await storage_get_bytes(remote_name)
+    if not raw:
+        return {"ok": 0, "failed": 1, "error": "ZIP upload unavailable"}
+    temp_dir = tempfile.mkdtemp(prefix="dashboard-import-")
+    try:
+        zip_path = os.path.join(temp_dir, "import.zip")
+        with open(zip_path, "wb") as fh:
+            fh.write(raw)
+        extract_dir = os.path.join(temp_dir, "x")
+        os.makedirs(extract_dir, exist_ok=True)
+        with zipfile.ZipFile(zip_path, "r") as archive:
+            archive.extractall(extract_dir)
+        found = []
+        for root, _dirs, files in os.walk(extract_dir):
+            for filename in files:
+                if filename.endswith(".session"):
+                    found.append(os.path.join(root, filename))
+        reserved = set(os.listdir(SESSIONS_DIR))
+        ok = failed = 0
+        for source in found:
+            stem = os.path.splitext(os.path.basename(source))[0]
+            filename = stem + ".session"
+            n = 1
+            while filename in reserved:
+                filename = f"{stem}_{n}.session"
+                n += 1
+            reserved.add(filename)
+            destination = os.path.join(SESSIONS_DIR, filename)
+            try:
+                shutil.copy2(source, destination)
+                source_stem = os.path.splitext(source)[0]
+                meta = {}
+                for candidate in (source_stem + ".json",
+                                  os.path.join(os.path.dirname(source), stem + ".json")):
+                    if os.path.exists(candidate):
+                        try:
+                            with open(candidate, "r", encoding="utf-8") as fh:
+                                loaded = json.load(fh)
+                            if isinstance(loaded, dict):
+                                meta = loaded
+                                break
+                        except Exception:
+                            pass
+                api_id, api_hash = creds_from_meta(meta)
+                device = device_profile_for(api_id, meta)
+                write_meta(destination, api_id=api_id, api_hash=api_hash,
+                           user_id=meta_get(meta, "user_id") or 0,
+                           first_name=meta_get(meta, "first_name") or "",
+                           phone=meta_get(meta, "phone") or "", **device)
+                await persist_session_bundle(destination)
+                ok += 1
+            except Exception as exc:
+                failed += 1
+                logger.warning("dashboard ZIP session %s: %s", source, exc)
+        if sharding_runtime_enabled():
+            await reconcile_account_shards()
+            await restore_runtime_storage(force=False)
+            await prune_local_sessions_not_owned()
+            # Worker.1 is the controller and may own the first shard. Load its
+            # newly assigned files immediately instead of waiting for the next
+            # 60-second reconcile tick.
+            await load_all_sessions()
+        return {"ok": ok, "failed": failed, "queued": ok,
+                "error": "" if not failed else "some files failed"}
+    except zipfile.BadZipFile:
+        return {"ok": 0, "failed": 1, "error": "invalid ZIP"}
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+async def _dashboard_manual_live_local(params: dict) -> dict:
+    target_link = str(params.get("target", "")).strip()
+    requested = max(1, int(params.get("count", 1) or 1))
+    ltype, parsed = parse_target(target_link)
+    if ltype not in ("public", "private"):
+        return {"ok": 0, "failed": 1, "error": "invalid channel link"}
+    selected = [str(key) for key in (params.get("keys") or []) if str(key).strip()]
+    if selected:
+        # The controller/web picker sends explicit global IDs. Each worker
+        # keeps only the IDs it owns, so no worker opens another shard's file.
+        local_keys = [key for key in selected[:requested]
+                      if local_worker_account(key) and acc_client(key)]
+    else:
+        ordered = ordered_live_account_keys()
+        local_keys = [key for key in ordered[:requested]
+                      if local_worker_account(key) and acc_client(key)]
+    if not local_keys:
+        return {"ok": 0, "failed": 0, "error": "no selected accounts on this worker"}
+    chat_id = None
+    for key in local_keys:
+        client = acc_client(key)
+        try:
+            if ltype == "public":
+                try:
+                    await client(JoinChannelRequest(parsed))
+                except UserAlreadyParticipantError:
+                    pass
+                entity = await client.get_entity(parsed)
+            else:
+                try:
+                    result = await client(ImportChatInviteRequest(parsed))
+                    chats = chats_from_join_result(result)
+                    entity = chats[0] if chats else await client.get_entity(target_link)
+                except UserAlreadyParticipantError:
+                    entity = await client.get_entity(target_link)
+            chat_id = utils.get_peer_id(entity)
+            break
+        except Exception:
+            continue
+    if chat_id is None:
+        return {"ok": 0, "failed": len(local_keys), "error": "channel not reachable"}
+    call = await get_active_call(chat_id, local_keys)
+    if call is None:
+        return {"ok": 0, "failed": len(local_keys), "error": "no active live stream"}
+    register_live_session(chat_id, local_keys, len(local_keys), target_link)
+    ok, errors = await join_live_with_audio(local_keys, chat_id, target_link)
+    return {"ok": ok, "failed": len(errors), "selected": len(local_keys)}
+
+
+async def _dashboard_live_local(params: dict):
+    action = str(params.get("mode", "stop"))
+    result = {"ok": 0, "failed": 0}
+    if action == "stop":
+        requested_chat = params.get("chat_id")
+        try:
+            requested_chat = int(requested_chat) if requested_chat not in (None, "") else None
+        except (TypeError, ValueError):
+            requested_chat = None
+        for chat_id, keys in list(LIVE_AUDIO.items()):
+            if requested_chat is not None and int(chat_id) != requested_chat:
+                continue
+            for key in list(keys):
+                try:
+                    await stop_live_audio(key, chat_id)
+                    result["ok"] += 1
+                except Exception as exc:
+                    result["failed"] += 1
+                    logger.warning("live stop %s/%s: %s", key, chat_id, exc)
+            end_live_session(chat_id)
+        return result
+    if action == "rotate":
+        for chat_id in list(LIVE_AUDIO):
+            _out, into = await rotate_live_accounts(chat_id)
+            result["ok"] += into
+        return result
+    if action == "start":
+        target = str(params.get("target", "")).strip()
+        ltype, parsed = parse_target(target)
+        if ltype not in ("public", "private"):
+            return {"ok": 0, "failed": 1, "error": "invalid channel link"}
+        # Join/resolve with one local account, then let the subscription-aware
+        # live starter choose the configured live package for this shard.
+        probe = acc_keys()[0] if acc_keys() else None
+        if not probe:
+            return {"ok": 0, "failed": 1, "error": "no local accounts"}
+        client = acc_client(probe)
+        try:
+            if ltype == "public":
+                try:
+                    await client(JoinChannelRequest(parsed))
+                except UserAlreadyParticipantError:
+                    pass
+                entity = await client.get_entity(parsed)
+            else:
+                entity = await client.get_entity(target)
+            chat_id = utils.get_peer_id(entity)
+            call = await get_active_call(chat_id, [probe])
+            if call is None:
+                return {"ok": 0, "failed": 1, "error": "no active live stream"}
+            await process_live_stream_start(chat_id, call)
+            return {"ok": len(LIVE_AUDIO.get(chat_id, set())), "failed": 0}
+        except Exception as exc:
+            return {"ok": 0, "failed": 1, "error": str(exc)[:120]}
+    return {"ok": 0, "failed": 1, "error": "unknown live action"}
+
+
+async def _dashboard_onboard_local(params: dict) -> dict:
+    stats = await onboard_new_accounts(list(acc_keys()))
+    return {"ok": stats.get("joins", 0) + stats.get("already", 0),
+            "failed": stats.get("failed", 0), "channels": stats.get("channels", 0)}
+
+
+async def run_dashboard_child_task(task: dict) -> dict:
+    action = task.get("action")
+    params = task.get("params") or {}
+    if action == "onboard":
+        return await _dashboard_onboard_local(params)
+    if action == "join":
+        return await _dashboard_join_local(params)
+    if action == "leave":
+        return await _dashboard_leave_local(params)
+    if action == "leave_all":
+        return await _dashboard_leave_all_local(params)
+    if action == "react":
+        return await _dashboard_react_local(params)
+    if action == "views":
+        return await _dashboard_views_local(params)
+    if action == "set_name":
+        return await _dashboard_set_name_local(params)
+    if action == "random_names":
+        return await _dashboard_random_names_local(params)
+    if action == "profile_photo":
+        return await _dashboard_profile_photo_local(params)
+    if action == "session_import":
+        return await _dashboard_session_import_local(params)
+    if action == "manual_live":
+        return await _dashboard_manual_live_local(params)
+    if action in {"live_start", "live_stop", "live_rotate"}:
+        params = dict(params)
+        params["mode"] = action[len("live_"):]
+        return await _dashboard_live_local(params)
+    return {"ok": 0, "failed": 1, "error": f"unsupported action: {action}"}
+
+
+async def dashboard_task_worker():
+    """Consume one dashboard child task for this worker shard at a time."""
+    # A one-second empty poll on every dyno multiplied MongoDB traffic during
+    # normal idle time. Two seconds keeps dashboard actions responsive while
+    # leaving the connection pool for Telegram events and shard leases.
+    while True:
+        await asyncio.sleep(2)
+        if col_dashboard_tasks is None:
+            continue
+        child = None
+        try:
+            child = await col_dashboard_tasks.find_one_and_update(
+                {"kind": "child", "worker_slot": WORKER_SLOT, "status": "queued"},
+                {"$set": {"status": "running", "worker_id": WORKER_INSTANCE_ID,
+                          "started_at": utcnow()}},
+                sort=[("created_at", 1)],
+                return_document=ReturnDocument.AFTER,
+            )
+            if not child:
+                continue
+            try:
+                result = await run_dashboard_child_task(child)
+                status = "done" if not result.get("error") else "partial"
+                await col_dashboard_tasks.update_one(
+                    {"_id": child["_id"]},
+                    {"$set": {"status": status, "result": result,
+                              "finished_at": utcnow()}},
+                )
+            except Exception as exc:
+                await col_dashboard_tasks.update_one(
+                    {"_id": child["_id"]},
+                    {"$set": {"status": "failed", "result": {"error": str(exc)[:200]},
+                              "finished_at": utcnow()}},
+                )
+        except Exception as exc:
+            logger.error("dashboard task worker: %s", exc)
+
+
+# ═══════════════════════ ACCOUNT STORE (MongoDB-backed sessions) ═══════════════════════
 class Account:
-    """One logged-in account, backed by a .session file in sessions/."""
+    """One logged-in account backed by a MongoDB/GridFS session bundle.
+
+    ``path`` is only the current dyno's local SQLite working copy; it is synced
+    back to MongoDB after imports, logins and during the periodic storage sweep.
+    """
 
     __slots__ = ("key", "stem", "path", "phone", "user_id", "name",
                  "api_id", "api_hash", "device", "client", "state")
@@ -545,6 +2005,7 @@ class Account:
 ACCOUNTS: Dict[str, Account] = {}
 # Sessions the folder holds that would not authorise. Never auto-deleted.
 PROBLEM_SESSIONS: Dict[str, str] = {}
+_PROBLEM_PURGE_RUNNING = False
 
 
 def acc_keys() -> List[str]:
@@ -555,18 +2016,219 @@ def acc_count() -> int:
     return len(acc_keys())
 
 
+def all_acc_keys() -> List[str]:
+    """Every account the bot knows about, dead ones included."""
+    return list(ACCOUNTS.keys())
+
+
+def dead_keys() -> List[str]:
+    """Accounts Telegram has told us are gone."""
+    return [k for k, a in ACCOUNTS.items() if a.state == "dead"]
+
+
+def frozen_keys() -> List[str]:
+    return [k for k in ACCOUNTS if is_frozen(k)]
+
+
+def account_known_dead(key: str) -> bool:
+    """True only for a key this worker has already proven dead.
+
+    Used where an account list is global (shard map) and most keys are not
+    registered locally: missing must never be read as dead.
+    """
+    acc = ACCOUNTS.get(key)
+    return acc is not None and acc.state == "dead"
+
+
+def account_usable(key: str) -> bool:
+    """Can this account be handed work right now?
+
+    Online, not known-dead and not frozen. Every picker goes through here: a
+    session that Telegram has killed, or one that answers every request with
+    FrozenMethodInvalidError, must not take a reaction, view, join or live slot
+    away from an account that still works.
+    """
+    acc = ACCOUNTS.get(key)
+    if acc is None or acc.client is None or acc.state == "dead":
+        return False
+    return not is_frozen(key)
+
+
+def usable_keys(keys: Optional[List[str]] = None) -> List[str]:
+    pool = acc_keys() if keys is None else list(keys)
+    return [k for k in pool if account_usable(k)]
+
+
+def usable_count() -> int:
+    return len(usable_keys())
+
+
+def _notify_owners_soon(text: str):
+    """Fire-and-forget owner notice — never let a notice break a job."""
+    async def send():
+        for owner in OWNER_IDS:
+            try:
+                await bot.send_message(owner, text)
+            except Exception as e:
+                logger.debug(f"owner notice failed: {e}")
+
+    try:
+        asyncio.create_task(send())
+    except RuntimeError:
+        pass          # no running loop (should not happen from the bot)
+
+
+def fleet_account_count() -> int:
+    """Total assigned accounts for UI limits; worker actions stay local."""
+    if sharding_runtime_enabled() and ACCOUNT_SLOT_BY_KEY:
+        return len(ACCOUNT_SLOT_BY_KEY)
+    return acc_count()
+
+
+def worker_task_keys(limit: int = 0) -> List[str]:
+    """Global deterministic account selection filtered to this worker shard."""
+    if sharding_runtime_enabled() and ACCOUNT_SLOT_BY_KEY:
+        ordered = sorted(ACCOUNT_SLOT_BY_KEY, key=lambda key: (
+            ACCOUNT_SLOT_BY_KEY.get(key, 10**9), str(key)))
+        if limit > 0:
+            ordered = ordered[:limit]
+        return [key for key in ordered if local_worker_account(key)]
+    keys = list(acc_keys())
+    return keys[:limit] if limit > 0 else keys
+
+
 def acc_client(key: str) -> Optional[TelegramClient]:
     a = ACCOUNTS.get(key)
     return a.client if a else None
 
 
-def mark_frozen(key: str):
-    """Remember that Telegram refused a membership call for this account."""
-    if key and key not in FROZEN_ACCOUNTS:
-        logger.warning(f"{key}: account is frozen — skipping it for joins "
-                       f"for the next {FROZEN_RETRY_AFTER // 3600}h")
-    if key:
-        FROZEN_ACCOUNTS[key] = time.monotonic()
+def mark_frozen(key: str, reason: str = ""):
+    """Remember that Telegram refused a membership call for this account.
+
+    Frozen accounts stay connected and stay in storage — the freeze usually
+    lifts on its own — but every join, invite and reaction is refused, so every
+    picker skips them until the cooldown lapses and we try once more. The mark
+    is written next to the session file as well, so restarting the worker does
+    not put them straight back to work.
+    """
+    first = key not in FROZEN_ACCOUNTS
+    FROZEN_ACCOUNTS[key] = time.monotonic()
+    if not first:
+        return
+    acc = ACCOUNTS.get(key)
+    label = acc.label if acc else key
+    logger.warning(f"{key}: account is frozen ({reason or 'method not available'}) "
+                   f"— skipped for {FROZEN_RETRY_AFTER // 3600}h, file kept")
+    if acc is not None:
+        write_meta(acc.path, frozen_at=time.time())
+    _notify_owners_soon(card(E_LOCK, "Account Frozen", [
+        field(E_PHONE, "Account", esc(label)),
+        f"{E_WARN} {S('Telegram refuses joins and reactions from it.')}",
+        f"{E_SHIELD} {S('Skipped for')} {FROZEN_RETRY_AFTER // 3600}h "
+        f"{S('and then retried. It is already skipped by every job.')}",
+    ]))
+
+
+def restore_frozen_mark(key: str, meta: dict):
+    """Put back a freeze that was recorded before the last restart."""
+    if key in FROZEN_ACCOUNTS:
+        return
+    try:
+        stamp = float(meta_get(meta, "frozen_at") or 0)
+    except (TypeError, ValueError):
+        return
+    if not stamp:
+        return
+    left = FROZEN_RETRY_AFTER - (time.time() - stamp)
+    if left <= 0:
+        # The cooldown already lapsed while the bot was down: let it work.
+        return
+    FROZEN_ACCOUNTS[key] = time.monotonic() - (FROZEN_RETRY_AFTER - left)
+    logger.info(f"{key}: still frozen from before the restart — "
+                f"skipping it for {int(left // 60)} more minute(s)")
+
+
+async def mark_dead(key: str, reason: str = "login gone", notify: bool = True) -> bool:
+    """Telegram says this login is gone — take the account out of the fleet.
+
+    Deleted, banned, key-revoked and session-terminated logins are permanent:
+    the file cannot work again without a fresh login. The account is dropped
+    from every pool, pulled out of any live call and disconnected, and the
+    reason is recorded under Accounts > Needs Review. The session file itself is
+    never touched — trashing it stays an explicit owner action.
+
+    Returns True the first time an account is marked.
+    """
+    acc = ACCOUNTS.get(key)
+    if acc is None:
+        return False
+    first = acc.state != "dead"
+    acc.state = "dead"
+    FROZEN_ACCOUNTS.pop(key, None)
+    PROBLEM_SESSIONS[acc.stem] = f"dead — {reason}"[:90]
+    if first:
+        logger.warning(f"{key}: {reason} — removed from the pool, no longer "
+                       f"picked for any job (file kept for review)")
+        if notify:
+            hint = S("It is skipped from now on. Needs Review > Move All to "
+                     "Trash moves the file out of the worker.")
+            _notify_owners_soon(card(E_RED, "Account Dead", [
+                field(E_PHONE, "Account", esc(acc.label)),
+                field(E_PERSON, "Name", esc(acc.name)),
+                f"{E_WARN} <code>{esc(reason[:90])}</code>",
+                "",
+                f"{E_SHIELD} {hint}",
+            ]))
+    await disconnect_account(key)
+    return first
+
+
+async def detach_dead_by_stem(stem: str, reason: str):
+    """A session no longer authorises — stop any client using it.
+
+    Without this an account that died while the bot was running stayed
+    registered (its client object was still in ACCOUNTS), so it kept being
+    picked for work even though its file could no longer log in.
+    """
+    for key in [k for k, a in ACCOUNTS.items() if a.stem == stem]:
+        await mark_dead(key, reason, notify=False)
+
+
+async def note_account_error(key: str, err: Exception) -> bool:
+    """Classify an error from a job and act on it.
+
+    Called from the reaction/view/join/live paths. If Telegram said the login is
+    gone the account is removed from the pool on the spot; if it said the
+    account is frozen it is parked. Without this the only thing that happened to
+    a dead account was a failed request, so it stayed in every picker and every
+    later job failed on it too.
+    """
+    if not key or is_db_locked(err):
+        return False
+    if is_dead_account_error(err):
+        await mark_dead(key, short_error(err))
+        return True
+    if is_frozen_account_error(err):
+        mark_frozen(key, short_error(err))
+        return True
+    return False
+
+
+def is_dead_problem(reason: str) -> bool:
+    """Is this Needs Review entry a login Telegram says is gone?
+
+    Only "dead" entries may be cleaned up in bulk. A locked file, a duplicate
+    or an unreadable sidecar is uncertainty, and uncertainty is never trashed —
+    that is the difference that keeps a bad night on Telegram's side from
+    costing real accounts.
+    """
+    return (reason or "").strip().lower().startswith("dead")
+
+
+def dead_problem_stems() -> List[str]:
+    """Session files in the folder that never authorise and cannot be fixed."""
+    return [stem for stem, reason in PROBLEM_SESSIONS.items()
+            if is_dead_problem(reason)]
 
 
 def is_frozen(key: str) -> bool:
@@ -575,16 +2237,18 @@ def is_frozen(key: str) -> bool:
     if ts is None:
         return False
     if time.monotonic() - ts > FROZEN_RETRY_AFTER:
-        # Freezes do get lifted. Let it back into the pool and find out.
+        # Freezes do get lifted. Let it back into the pool and find out. The
+        # frozen_at stamp next to the session file is left behind on purpose:
+        # it is in the past, so a restart ignores it instead of re-freezing.
         FROZEN_ACCOUNTS.pop(key, None)
         return False
     return True
 
 
 def joinable_keys(keys: Optional[List[str]] = None) -> List[str]:
-    """Online accounts that can actually join something right now."""
+    """Accounts that can actually join something right now."""
     pool = acc_keys() if keys is None else keys
-    return [k for k in pool if acc_client(k) and not is_frozen(k)]
+    return [k for k in pool if account_usable(k)]
 
 
 def joinable_count() -> int:
@@ -630,12 +2294,8 @@ def creds_from_meta(meta: dict) -> Tuple[int, str]:
     return API_ID, API_HASH
 
 
-def to_trash(session_path: str) -> int:
-    """Move a session (and its sidecar) to sessions_trash instead of deleting it.
-
-    Deleting is irreversible and a wrong "this is dead" call then costs a real
-    account, so nothing here ever unlinks a file.
-    """
+async def to_trash(session_path: str) -> int:
+    """Move a session bundle to MongoDB-backed trash instead of deleting it."""
     os.makedirs(TRASH_DIR, exist_ok=True)
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     stem = os.path.splitext(os.path.basename(session_path))[0]
@@ -643,43 +2303,64 @@ def to_trash(session_path: str) -> int:
     base = os.path.splitext(session_path)[0]
     for ext in (".session", ".session-journal", ".session-wal", ".session-shm", ".json"):
         src = base + ext
-        if os.path.exists(src):
-            try:
-                os.replace(src, os.path.join(TRASH_DIR, f"{stem}_{stamp}{ext}"))
-                moved += 1
-            except Exception as e:
-                logger.warning(f"trash {src}: {e}")
+        if not os.path.exists(src):
+            continue
+        destination = os.path.join(TRASH_DIR, f"{stem}_{stamp}{ext}")
+        try:
+            os.replace(src, destination)
+            source_name = _session_remote_name(src)
+            destination_name = _storage_name("trash", os.path.basename(destination))
+            moved_remote = await storage_move(source_name, destination_name,
+                                              kind="trash")
+            if not moved_remote:
+                # This covers a newly-created local session that has not reached
+                # the periodic sweep yet. Upload the moved local copy before
+                # considering the operation complete.
+                await storage_put_path(destination_name, destination,
+                                       kind="trash", force=True)
+                await storage_delete(source_name)
+            moved += 1
+        except Exception as exc:
+            logger.warning("trash %s: %s", src, exc)
     return moved
 
 
 def trash_entries() -> List[str]:
+    """List the restored local trash mirror for the current dyno."""
     if not os.path.isdir(TRASH_DIR):
         return []
     return sorted(f for f in os.listdir(TRASH_DIR) if f.endswith(".session"))
 
 
-def restore_from_trash() -> int:
-    """Move every trashed session back into sessions/."""
+async def restore_from_trash() -> int:
+    """Restore every trashed session and sidecar, then sync the move to Mongo."""
     restored = 0
-    for f in trash_entries():
-        stem = f[: -len(".session")]
-        # strip the _YYYYmmdd_HHMMSS stamp to recover the original name
+    for filename in trash_entries():
+        stem = filename[: -len(".session")]
         orig = re.sub(r"_\d{8}_\d{6}$", "", stem)
         for ext in (".session", ".json"):
-            src = os.path.join(TRASH_DIR, stem + ext)
-            if not os.path.exists(src):
+            source = os.path.join(TRASH_DIR, stem + ext)
+            if not os.path.exists(source):
                 continue
-            dest = os.path.join(SESSIONS_DIR, orig + ext)
+            destination = os.path.join(SESSIONS_DIR, orig + ext)
             n = 1
-            while os.path.exists(dest):
-                dest = os.path.join(SESSIONS_DIR, f"{orig}_{n}{ext}")
+            while os.path.exists(destination):
+                destination = os.path.join(SESSIONS_DIR, f"{orig}_{n}{ext}")
                 n += 1
             try:
-                os.replace(src, dest)
+                os.replace(source, destination)
+                source_name = _storage_name("trash", os.path.basename(source))
+                destination_name = _session_remote_name(destination)
+                moved_remote = await storage_move(source_name, destination_name,
+                                                  kind="session")
+                if not moved_remote:
+                    await storage_put_path(destination_name, destination,
+                                           kind="session", force=True)
+                    await storage_delete(source_name)
                 if ext == ".session":
                     restored += 1
-            except Exception as e:
-                logger.warning(f"restore {src}: {e}")
+            except Exception as exc:
+                logger.warning("restore %s: %s", source, exc)
     return restored
 
 
@@ -702,13 +2383,21 @@ async def probe_and_register(session_path: str) -> Tuple[str, Optional[Account]]
                 os.path.splitext(session_path)[0], api_id, api_hash, **device
             )
             await client.connect()
-            if not await client.is_user_authorized():
+            # is_user_authorized() only means "a call that needs auth failed" and
+            # swallows the reason, so ask the server once instead: get_me()
+            # answers None for a login Telegram no longer recognises (deleted,
+            # banned, key revoked, session terminated) and raises for everything
+            # else. A blip therefore lands in "unknown", never in "dead".
+            me = await client.get_me()
+            if me is None:
                 await client.disconnect()
                 acc.state = "dead"
-                PROBLEM_SESSIONS[stem] = "not authorised"
+                # A file that stopped authorising must also stop the client that
+                # an earlier load left registered and running.
+                await detach_dead_by_stem(stem, "not authorised")
+                PROBLEM_SESSIONS[stem] = "dead — not authorised"
                 return "dead", acc
 
-            me = await client.get_me()
             acc.client = client
             acc.user_id = getattr(me, "id", 0) or 0
             acc.phone = f"+{me.phone}" if getattr(me, "phone", None) else ""
@@ -733,9 +2422,22 @@ async def probe_and_register(session_path: str) -> Tuple[str, Optional[Account]]
 
             ACCOUNTS[acc.key] = acc
             PROBLEM_SESSIONS.pop(stem, None)
+            # A freeze recorded before the last restart is still valid.
+            restore_frozen_mark(acc.key, meta)
             write_meta(session_path, api_id=api_id, api_hash=api_hash,
                        user_id=acc.user_id, phone=acc.phone,
                        first_name=acc.name, **device)
+            await persist_session_bundle(session_path)
+            remote_name = _session_remote_name(session_path)
+            if sharding_runtime_enabled() and col_account_shards is not None:
+                await col_account_shards.update_one(
+                    {"_id": remote_name},
+                    {"$set": {"account_key": acc.key,
+                              "updated_at": utcnow()}},
+                    upsert=True,
+                )
+                ACCOUNT_SLOT_BY_KEY[acc.key] = WORKER_SLOT
+                ACCOUNT_REMOTE_BY_KEY[acc.key] = remote_name
             return "alive", acc
 
         except Exception as e:
@@ -758,7 +2460,9 @@ async def probe_and_register(session_path: str) -> Tuple[str, Optional[Account]]
                 return "unknown", acc
             if is_dead_account_error(e):
                 logger.warning(f"{stem}: {e}")
-                PROBLEM_SESSIONS[stem] = str(e)[:60]
+                acc.state = "dead"
+                await detach_dead_by_stem(stem, short_error(e))
+                PROBLEM_SESSIONS[stem] = f"dead — {short_error(e)}"[:90]
                 return "dead", acc
             logger.error(f"{stem}: {type(e).__name__}: {e}")
             PROBLEM_SESSIONS[stem] = f"{type(e).__name__}"
@@ -819,12 +2523,13 @@ async def import_string_session(session_string: str, hint: str = "") -> Optional
 
     write_meta(dest, api_id=API_ID, api_hash=API_HASH, phone=phone,
                **ANDROID_PROFILE)
+    await persist_session_bundle(dest)
     state, acc = await probe_and_register(dest)
     return acc if state == "alive" else None
 
 
 async def load_all_sessions(progress=None) -> dict:
-    """Load every account from the sessions folder. The folder is the truth."""
+    """Load every account from the MongoDB-restored working directory."""
     logger.info("Loading accounts from sessions/ ...")
     files = sorted(
         os.path.join(SESSIONS_DIR, f)
@@ -834,7 +2539,7 @@ async def load_all_sessions(progress=None) -> dict:
     logger.info(f"{len(files)} .session file(s) found")
 
     tally = {"alive": 0, "dead": 0, "unknown": 0}
-    sem = asyncio.Semaphore(10)
+    sem = asyncio.Semaphore(SESSION_CONNECT_CONCURRENCY)
 
     async def one(path):
         async with sem:
@@ -846,6 +2551,22 @@ async def load_all_sessions(progress=None) -> dict:
         await asyncio.gather(*(one(p) for p in files[i:i + 25]))
         if progress:
             await progress(min(i + 25, len(files)), len(files), tally)
+
+    # Accounts whose file is no longer in the working folder (trashed, renamed
+    # or moved away by hand) must stop being used: otherwise the client from the
+    # previous load stays registered and keeps answering jobs for an account the
+    # owner already took off the fleet. Files that are merely unreadable stay put
+    # — a lock is not a reason to forget an account.
+    present = {os.path.splitext(os.path.basename(p))[0] for p in files}
+    for key in list(ACCOUNTS):
+        acc = ACCOUNTS.get(key)
+        if acc is None or acc.stem in present:
+            continue
+        logger.warning(f"{key}: {acc.stem}.session is not in the working folder "
+                       f"any more — taking it offline")
+        await disconnect_account(key)
+        ACCOUNTS.pop(key, None)
+        PROBLEM_SESSIONS.pop(acc.stem, None)
 
     # string.txt is converted into real session files so nothing lives outside
     # the folder's own format.
@@ -860,6 +2581,7 @@ async def load_all_sessions(progress=None) -> dict:
             await asyncio.sleep(0.3)
         try:
             os.replace(string_file, string_file + ".imported")
+            await storage_delete(_storage_name("sessions", "string.txt"))
         except Exception:
             pass
 
@@ -884,24 +2606,76 @@ async def disconnect_account(key: str):
         pass
     acc.client = None
     clients_with_monitor.discard(key)
+    # Peers were resolved with this client; a later re-registration gets a new
+    # one, so cached input entities for it must not be reused.
+    for cached in [k for k in PEER_CACHE if k[0] == key]:
+        PEER_CACHE.pop(cached, None)
+
+
+async def check_account_health(key: str) -> str:
+    """Ask Telegram whether this login still works.
+
+    Returns "ok" | "dead" | "frozen" | "unclear". ``get_me()`` is the server's
+    own answer — it returns None for a login Telegram no longer recognises
+    (deleted, banned, key revoked, session terminated) and raises for a frozen
+    account. A network blip is "unclear" and changes nothing, because a timeout
+    is not evidence that an account is gone.
+    """
+    client = acc_client(key)
+    if client is None:
+        return "unclear"
+    try:
+        me = await client.get_me()
+    except Exception as e:
+        if is_db_locked(e):
+            return "unclear"
+        if is_dead_account_error(e):
+            await mark_dead(key, short_error(e))
+            return "dead"
+        if is_frozen_account_error(e):
+            mark_frozen(key, short_error(e))
+            return "frozen"
+        logger.debug(f"health {key}: {type(e).__name__}: {e}")
+        return "unclear"
+    if me is None:
+        await mark_dead(key, "login no longer authorised")
+        return "dead"
+    return "ok"
 
 
 async def keep_alive_task():
-    """One sweeper for every account, instead of a task per account."""
+    """Presence ping for every account, plus a rolling health check.
+
+    The ping keeps the sessions looking active. On top of that a slice of the
+    fleet is checked with get_me() each cycle: that is the call that tells a
+    deleted or key-revoked login apart from a live one, so an account that dies
+    while the bot is running is caught without waiting for a job to fail on it.
+    """
     while True:
         await asyncio.sleep(KEEP_ALIVE_INTERVAL)
         keys = acc_keys()
         random.shuffle(keys)
+        probing = set(keys[:HEALTH_PROBE_PER_CYCLE])
         for key in keys:
             client = acc_client(key)
             if not client:
                 continue
             try:
+                if key in probing:
+                    if await check_account_health(key) == "dead":
+                        await asyncio.sleep(random.uniform(0.2, 0.8))
+                        continue
                 await client(UpdateStatusRequest(offline=False))
             except Exception as e:
-                if is_dead_account_error(e):
+                if is_db_locked(e):
+                    pass
+                elif is_dead_account_error(e):
                     logger.warning(f"{key} reported dead by Telegram: {e}")
-                    ACCOUNTS[key].state = "dead"
+                    await mark_dead(key, short_error(e))
+                elif is_frozen_account_error(e):
+                    mark_frozen(key, short_error(e))
+                else:
+                    logger.debug(f"keepalive {key}: {type(e).__name__}: {e}")
             await asyncio.sleep(random.uniform(0.2, 0.8))
 
 
@@ -1176,7 +2950,10 @@ def pick_workers(pool: List[str], n: int) -> List[str]:
     """
     if n <= 0:
         return []
-    cand = [k for k in pool if acc_client(k)]
+    # Dead, frozen and offline accounts are not candidates at all: handing them
+    # the job only produces a failed request and a post that delivers less than
+    # the client paid for.
+    cand = [k for k in pool if account_usable(k)]
     random.shuffle(cand)  # ties break randomly, not by list order
     cand.sort(key=lambda k: (live_busy_in(k) is not None,
                              ACC_INFLIGHT.get(k, 0),
@@ -1214,8 +2991,10 @@ async def join_extra_accounts(doc: dict, keys: List[str]) -> List[str]:
 
     async def join_one(key):
         async with sem:
+            if not account_usable(key):
+                return
             client = acc_client(key)
-            if not client or is_frozen(key):
+            if client is None:
                 return
             try:
                 if spec:
@@ -1230,8 +3009,7 @@ async def join_extra_accounts(doc: dict, keys: List[str]) -> List[str]:
             except UserAlreadyParticipantError:
                 ok.append(key)
             except Exception as e:
-                if is_frozen_account_error(e):
-                    mark_frozen(key)
+                await note_account_error(key, e)
                 await log_activity(key, "CLIENT_JOIN", doc["channel_link"],
                                    str(e)[:40])
             await asyncio.sleep(0.4)
@@ -1293,7 +3071,7 @@ async def onboard_new_accounts(keys: List[str],
     Joins are the flood-sensitive call, so they go one account at a time per
     channel with a real pause between them.
     """
-    keys = [k for k in dict.fromkeys(keys) if acc_client(k) and not is_frozen(k)]
+    keys = [k for k in dict.fromkeys(keys) if account_usable(k)]
     stats = {"accounts": len(keys), "channels": 0, "done_channels": 0,
              "joins": 0, "already": 0, "failed": 0, "frozen": 0, "skipped": 0,
              "subs_grown": 0}
@@ -1315,7 +3093,9 @@ async def onboard_new_accounts(keys: List[str],
         fresh: List[str] = []
 
         for key in todo:
-            if is_frozen(key):
+            # Frozen and dead accounts are skipped here and, if Telegram says so
+            # mid-join, they are dropped from the pool by the handler below.
+            if not account_usable(key):
                 stats["skipped"] += 1
                 continue
             if load.get(key, 0) >= MAX_CHANNELS_PER_ACCOUNT:
@@ -1352,27 +3132,37 @@ async def onboard_new_accounts(keys: List[str],
                     await asyncio.sleep(e.seconds)
             except Exception as e:
                 if is_frozen_account_error(e):
-                    mark_frozen(key)
+                    mark_frozen(key, short_error(e))
                     stats["frozen"] += 1
                 else:
                     stats["failed"] += 1
                     logger.warning(f"onboard {key} -> "
                                    f"{sub.get('channel_link')}: "
                                    f"{type(e).__name__}: {str(e)[:80]}")
+                # A dead login leaves the fleet here instead of being retried on
+                # every later sweep.
+                if is_dead_account_error(e):
+                    await mark_dead(key, short_error(e))
                 await log_activity(key, "AUTO_JOIN", sub["channel_link"],
                                    str(e)[:40])
             await asyncio.sleep(random.uniform(1.0, 2.0))
 
         if fresh:
             total_now = len(already_in | set(fresh))
+            # ``accounts_count`` is the package target, while
+            # ``joined_accounts`` is the current membership snapshot. After a
+            # deliberate session purge the snapshot can be empty even though
+            # the client still bought N accounts; never shrink the package to
+            # the number of replacement accounts added so far.
+            package_target = max(
+                int(sub.get("accounts_count", 0) or 0),
+                total_now,
+            )
             try:
                 await col_clients.update_one(
                     {"_id": sub["_id"]},
                     {"$addToSet": {"joined_accounts": {"$each": fresh}},
-                     # The package size follows the real membership: the client
-                     # bought N accounts and now has more, and every picker
-                     # reads accounts_count when deciding how many to use.
-                     "$set": {"accounts_count": total_now,
+                     "$set": {"accounts_count": package_target,
                               "updated_at": utcnow()}})
                 stats["subs_grown"] += 1
                 logger.info(f"onboard: {sub.get('channel_link')} "
@@ -1688,7 +3478,13 @@ async def resolve_peer(key: str, client: TelegramClient, spec):
             async for _ in client.iter_dialogs(limit=200):
                 pass
             peer = await client.get_input_entity(target)
-        except Exception:
+        except Exception as second:
+            # A dead or frozen login is why the peer cannot be resolved here.
+            # Record it now, otherwise the account silently keeps being handed
+            # posts it can never deliver.
+            if not await note_account_error(key, second):
+                logger.debug(f"resolve {key} {spec}: "
+                             f"{type(second).__name__}: {second}")
             return None
     PEER_CACHE[cache_key] = peer
     return peer
@@ -1703,7 +3499,8 @@ def invalidate_peer_cache(spec=None):
 
 
 # ═══════════════════════ REACTION / VIEW PRIMITIVES ═══════════════════════
-async def send_reaction(client, peer, msg_id, emoji) -> Tuple[bool, Optional[str]]:
+async def send_reaction(client, peer, msg_id, emoji,
+                        key: str = "") -> Tuple[bool, Optional[str]]:
     try:
         await client(SendReactionRequest(
             peer=peer, msg_id=msg_id,
@@ -1723,13 +3520,18 @@ async def send_reaction(client, peer, msg_id, emoji) -> Tuple[bool, Optional[str
                 ))
                 return True, None
             except Exception as e2:
+                await note_account_error(key, e2)
                 return False, f"after flood: {str(e2)[:40]}"
         return False, f"flood {e.seconds}s"
     except Exception as e:
+        # The one place every reaction passes through: a dead or frozen account
+        # is taken out of the pool here rather than being retried on every post.
+        await note_account_error(key, e)
         return False, str(e)[:60]
 
 
-async def send_views(client, peer, msg_ids: List[int]) -> Tuple[bool, Optional[str]]:
+async def send_views(client, peer, msg_ids: List[int],
+                     key: str = "") -> Tuple[bool, Optional[str]]:
     """Increment the real view counter.
 
     ``get_messages`` only *reads* a post; the counter only moves for
@@ -1751,13 +3553,15 @@ async def send_views(client, peer, msg_ids: List[int]) -> Tuple[bool, Optional[s
                 ))
                 return True, None
             except Exception as e2:
+                await note_account_error(key, e2)
                 return False, f"after flood: {str(e2)[:40]}"
         return False, f"flood {e.seconds}s"
     except Exception as e:
+        await note_account_error(key, e)
         return False, str(e)[:60]
 
 
-async def ensure_member(client, spec) -> bool:
+async def ensure_member(client, spec, key: str = "") -> bool:
     if not isinstance(spec, str):
         return True
     try:
@@ -1766,10 +3570,9 @@ async def ensure_member(client, spec) -> bool:
     except UserAlreadyParticipantError:
         return True
     except Exception as e:
-        if is_frozen_account_error(e):
-            # The key is not passed in here, so the caller's own handler records
-            # it; log it once so the reason is visible in bot.log.
-            logger.debug(f"ensure_member: frozen account refused {spec}")
+        # Joining is the call a frozen account is refused first, so this is
+        # where a freeze is most often discovered.
+        await note_account_error(key, e)
         return False
 
 
@@ -1829,7 +3632,7 @@ async def execute_join(event, state, limit):
 
     async def join_one(key, info):
         async with sem:
-            client = acc_client(key)
+            client = acc_client(key) if account_usable(key) else None
             if not client:
                 counters["failed"] += 1
                 counters["done"] += 1
@@ -1862,8 +3665,9 @@ async def execute_join(event, state, limit):
                     counters["failed"] += 1
                     await log_activity(key, "JOIN", info["link"], f"flood {e.seconds}s")
             except Exception as e:
-                if is_frozen_account_error(e):
-                    mark_frozen(key)
+                # A dead or frozen account drops out of the pool right here
+                # instead of failing this join on every link that follows.
+                await note_account_error(key, e)
                 counters["failed"] += 1
                 await log_activity(key, "JOIN", info["link"], str(e)[:40])
             counters["done"] += 1
@@ -1900,10 +3704,15 @@ async def execute_react_view(event, state, limit, multi=False):
     emojis = state["emojis"] if multi else [state["emoji"]]
     speed = state.get("speed", 0.2)
     do_views = state.get("do_views", True)
-    keys = acc_keys()[:limit]
+    keys = usable_keys()[:limit]
     if not keys:
-        return await event.respond(card(E_CROSS, "No Accounts", [S("Add accounts first.")]),
-                                   buttons=kb_nav())
+        return await event.respond(card(E_CROSS, "No Usable Account", [
+            field(E_PERSON, "Accounts online", str(acc_count())),
+            field(E_LOCK, "Frozen", str(len(frozen_keys()))),
+            field(E_RED, "Dead", str(len(dead_keys()))),
+            "",
+            S("Every online account is frozen, dead or offline."),
+        ]), buttons=kb_nav())
 
     title = "Multi React" if multi else "React & View"
     msg = await event.respond(card(E_FIRE, title, [
@@ -1925,7 +3734,7 @@ async def execute_react_view(event, state, limit, multi=False):
                 return
             peer = await resolve_peer(key, client, spec)
             if peer is None and isinstance(spec, str):
-                await ensure_member(client, spec)
+                await ensure_member(client, spec, key)
                 peer = await resolve_peer(key, client, spec)
             if peer is None:
                 c["noaccess"] += 1
@@ -1933,7 +3742,7 @@ async def execute_react_view(event, state, limit, multi=False):
                 return
 
             for emoji in emojis:
-                ok, err = await send_reaction(client, peer, msg_id, emoji)
+                ok, err = await send_reaction(client, peer, msg_id, emoji, key)
                 if ok:
                     c["react"] += 1
                 else:
@@ -1944,7 +3753,7 @@ async def execute_react_view(event, state, limit, multi=False):
                     await asyncio.sleep(0.1)
 
             if do_views:
-                ok, _ = await send_views(client, peer, [msg_id])
+                ok, _ = await send_views(client, peer, [msg_id], key)
                 if ok:
                     c["views"] += 1
 
@@ -1984,10 +3793,15 @@ async def execute_react_view(event, state, limit, multi=False):
 
 async def execute_views(event, links: List[str], limit: int):
     """Send real views for one or many posts, batching ids per channel."""
-    keys = acc_keys()[:limit] if limit > 0 else acc_keys()
+    keys = usable_keys()[:limit] if limit > 0 else usable_keys()
     if not keys:
-        return await event.respond(card(E_CROSS, "No Accounts", [S("Add accounts first.")]),
-                                   buttons=kb_nav())
+        return await event.respond(card(E_CROSS, "No Usable Account", [
+            field(E_PERSON, "Accounts online", str(acc_count())),
+            field(E_LOCK, "Frozen", str(len(frozen_keys()))),
+            field(E_RED, "Dead", str(len(dead_keys()))),
+            "",
+            S("Every online account is frozen, dead or offline."),
+        ]), buttons=kb_nav())
 
     # group post ids per channel so one request covers many posts
     grouped: Dict[object, List[int]] = {}
@@ -2025,7 +3839,7 @@ async def execute_views(event, links: List[str], limit: int):
                 return
             peer = await resolve_peer(key, client, spec)
             if peer is None and isinstance(spec, str):
-                await ensure_member(client, spec)
+                await ensure_member(client, spec, key)
                 peer = await resolve_peer(key, client, spec)
             if peer is None:
                 c["noaccess"] += 1
@@ -2034,7 +3848,7 @@ async def execute_views(event, links: List[str], limit: int):
                 return
             for i in range(0, len(ids), VIEW_BATCH_SIZE):
                 chunk = ids[i:i + VIEW_BATCH_SIZE]
-                ok, err = await send_views(client, peer, chunk)
+                ok, err = await send_views(client, peer, chunk, key)
                 if ok:
                     c["ok"] += 1
                     c["views"] += len(chunk)
@@ -2273,6 +4087,48 @@ async def get_allowed_reactions(key: str, client, peer) -> Optional[list]:
 
 
 # ═══════════════════════ AUTO REACT / VIEW ON NEW POSTS ═══════════════════════
+def local_worker_account(key: str) -> bool:
+    if not acc_client(key):
+        return False
+    if not sharding_runtime_enabled():
+        return True
+    # A key learned from a newly probed session is local until the next shard
+    # reconciliation; never let a worker use a key explicitly assigned away.
+    return ACCOUNT_SLOT_BY_KEY.get(key, WORKER_SLOT) == WORKER_SLOT
+
+
+def globally_ordered_joined(joined: list) -> list:
+    if not sharding_runtime_enabled():
+        return [key for key in joined if acc_client(key)]
+    return sorted(
+        list(dict.fromkeys(joined)),
+        key=lambda key: (ACCOUNT_SLOT_BY_KEY.get(key, 10**9), str(key)),
+    )
+
+
+def split_package_for_shard(joined_global, count, is_local=None):
+    """Split one post package across worker shards without changing the total.
+
+    ``joined_global`` must be the subscription's full joined list in
+    deterministic fleet order (``globally_ordered_joined``) and ``count`` the
+    whole package (reactions or views for one post). Every worker takes the
+    SAME global first-``count`` selection and keeps only the keys it owns
+    (``is_local``), so the slice is stable and identical everywhere.
+
+    Summed over the fleet the delivered count equals ``count`` exactly. The
+    old code filtered the pool down to local sessions *before* slicing, so on
+    a 3-dyno fleet every worker sent ``min(package, shard_size)`` — a
+    10-reaction package silently became 30, and a package larger than one
+    shard came up short. ``is_local=None`` (single process) returns the plain
+    first-``count`` slice, exactly like the old non-sharded behaviour.
+    """
+    count = max(0, int(count or 0))
+    global_pick = list(joined_global[:count])
+    if is_local is None:
+        return global_pick, list(global_pick)
+    return global_pick, [k for k in global_pick if is_local(k)]
+
+
 async def process_new_post(channel_id: int, message_id: int):
     subs = await get_active_subscriptions_for_channel(channel_id)
     if not subs:
@@ -2283,38 +4139,60 @@ async def process_new_post(channel_id: int, message_id: int):
             await update_client_status(str(sub["_id"]), "expired")
             continue
 
-        joined = [k for k in sub.get("joined_accounts", []) if acc_client(k)]
-        if not joined:
-            logger.info(f"sub {sub['_id']}: no joined account is online")
-            continue
+        recorded = globally_ordered_joined(sub.get("joined_accounts", []))
+        if sharding_runtime_enabled():
+            # Fleet-wide pool: every worker must count the subscription's WHOLE
+            # joined list before slicing, not just the sessions it owns.
+            # ACCOUNTS only holds this shard's sessions, so the old local
+            # account_usable() filter shrank the pool to one shard and each
+            # worker then sent min(package, shard_size) — workers x package in
+            # total, or short once the package outgrew a single shard. Local
+            # usability is still enforced per account inside deliver() and the
+            # spares; unreachable sessions simply fail over there.
+            joined = list(recorded)
+            if not joined:
+                logger.info(f"sub {sub['_id']}: no joined accounts on record")
+                continue
+        else:
+            # Single process: only accounts that can really deliver count — a
+            # dead, frozen or offline session took a slot here and produced
+            # nothing, which is why some posts came up short while the log
+            # said the package was planned.
+            joined = [k for k in recorded if account_usable(k)]
+            if not joined:
+                logger.info(f"sub {sub['_id']}: no usable joined account "
+                            f"({len(recorded)} recorded, "
+                            f"{len(recorded) - len(joined)} dead/frozen/offline)")
+                continue
 
         spec = sub.get("channel_username") or norm_channel_id(sub.get("channel_id")) \
             or channel_id
         n_react = min(int(sub.get("reactions_per_post", 0) or 0), len(joined))
         n_views = min(int(sub.get("views_per_post", 0) or 0), len(joined))
 
-        # Least-recently-worked accounts first, so the load walks around the
-        # whole joined list instead of landing on whoever the dice picked. The
-        # view slice is taken after the react slice is marked busy, which makes
-        # the two lists prefer different accounts without forcing them apart:
-        # if the sub only has a handful joined, overlap is still allowed.
-        react_keys = pick_workers(joined, n_react)
+        # In sharded mode the package is selected globally, then each worker
+        # executes only the selected keys it owns. Without this split every
+        # worker would send the full package and multiply reactions/views by
+        # the number of workers. The split keeps the local slice order aligned
+        # with the global order, so the emoji plan indexes still match.
+        global_react, react_keys = split_package_for_shard(
+            joined, n_react, local_worker_account)
+        global_view, view_keys = split_package_for_shard(
+            joined, n_views, local_worker_account)
         for k in react_keys:
             ACC_INFLIGHT[k] = ACC_INFLIGHT.get(k, 0) + 1
         try:
-            view_keys = pick_workers(joined, n_views)
+            view_keys = pick_workers(view_keys, len(view_keys))
         finally:
             for k in react_keys:
                 ACC_INFLIGHT[k] = max(0, ACC_INFLIGHT.get(k, 1) - 1)
 
-        # Anyone not picked is a stand-in. When a chosen account fails — flood
-        # wait, peer not resolvable, reaction rejected — the work is handed to
-        # one of these instead of being silently dropped. Without this a burst
-        # of posts delivered whatever happened to succeed, which is why some
-        # posts in the same minute got the full package and others got half.
-        react_spares = [k for k in pick_workers(joined, len(joined))
+        local_joined = [k for k in joined if local_worker_account(k)]
+        # A failure can only be retried by this worker's own shard; another
+        # worker must not open a session it does not own.
+        react_spares = [k for k in pick_workers(local_joined, len(local_joined))
                         if k not in react_keys]
-        view_spares = [k for k in pick_workers(joined, len(joined))
+        view_spares = [k for k in pick_workers(local_joined, len(local_joined))
                        if k not in view_keys]
 
         # Use the shared global semaphore so all concurrent process_new_post
@@ -2329,26 +4207,44 @@ async def process_new_post(channel_id: int, message_id: int):
             if probe_peer is not None:
                 allowed = await get_allowed_reactions(probe, acc_client(probe),
                                                       probe_peer)
-            for emoji, count in distribute_reactions(len(react_keys), allowed).items():
-                emoji_plan.extend([emoji] * count)
-            random.shuffle(emoji_plan)
+            global_plan = []
+            for emoji, count in distribute_reactions(n_react, allowed).items():
+                global_plan.extend([emoji] * count)
+            random.shuffle(global_plan)
+            # Preserve one reaction job per selected local account while the
+            # emoji distribution still represents the whole package.
+            index_by_key = {key: index for index, key in enumerate(global_react)}
+            emoji_plan = [global_plan[index_by_key[key]]
+                          for key in react_keys
+                          if index_by_key.get(key, n_react) < len(global_plan)]
 
         done = {"react": 0, "view": 0}
         spare_lock = asyncio.Lock()
 
         async def take_spare(pool: List[str]) -> Optional[str]:
+            """Next spare that can actually deliver something."""
             async with spare_lock:
-                return pool.pop(0) if pool else None
+                while pool:
+                    candidate = pool.pop(0)
+                    if account_usable(candidate):
+                        return candidate
+                return None
 
         async def deliver(kind: str, key: str, emoji: Optional[str],
                           spares: List[str]):
             """Land one reaction/view, moving to a spare account on failure."""
-            for _ in range(1 + AUTO_RETRY_SPARES):
+            attempts = 1 + AUTO_RETRY_SPARES
+            for attempt in range(attempts):
                 if key is None:
-                    return
+                    break
+                more = attempt + 1 < attempts
+                if not account_usable(key):
+                    # Dead, frozen or offline: no request is worth sending.
+                    key = await take_spare(spares) if more else None
+                    continue
                 client = acc_client(key)
                 if client is None:
-                    key = await take_spare(spares)
+                    key = await take_spare(spares) if more else None
                     continue
                 async with sem:
                     with working(key):
@@ -2356,10 +4252,11 @@ async def process_new_post(channel_id: int, message_id: int):
                         if peer is not None:
                             if kind == "react":
                                 ok, err = await send_reaction(client, peer,
-                                                              message_id, emoji)
+                                                              message_id, emoji,
+                                                              key)
                             else:
                                 ok, err = await send_views(client, peer,
-                                                           [message_id])
+                                                           [message_id], key)
                         else:
                             ok, err = False, "peer unresolved"
                 # Sleep outside the semaphore: holding a concurrency slot while
@@ -2372,7 +4269,9 @@ async def process_new_post(channel_id: int, message_id: int):
                     return
                 logger.debug(f"post {message_id}: {kind} via {key} failed "
                              f"({err}) — trying a spare")
-                key = await take_spare(spares)
+                # Only borrow a spare while an attempt is left to use it; the
+                # old code popped one more and dropped it on the floor.
+                key = await take_spare(spares) if more else None
             if key is None:
                 logger.debug(f"post {message_id}: no spare left for a {kind}")
 
@@ -2385,21 +4284,36 @@ async def process_new_post(channel_id: int, message_id: int):
             *[deliver("view", k, None, view_spares) for k in view_keys],
             return_exceptions=True)
 
-        await col_clients.update_one({"_id": sub["_id"]},
-                                     {"$inc": {"total_posts_processed": 1}})
+        if IS_CONTROLLER_WORKER:
+            await col_clients.update_one({"_id": sub["_id"]},
+                                         {"$inc": {"total_posts_processed": 1}})
         await increment_stats(reactions=done["react"], views=done["view"])
         # Report what actually landed, not what was planned. The old line
         # printed the plan, so a post that delivered half looked perfect in the
-        # log — which is why short deliveries went unnoticed.
+        # log — which is why short deliveries went unnoticed. In sharded mode
+        # each worker measures itself against ITS OWN slice of the package:
+        # comparing local deliveries with the whole package would cry SHORT on
+        # every dyno even when the fleet delivered the full count together.
+        want_react = len(react_keys)
+        want_view = len(view_keys)
+        if sharding_runtime_enabled() and not want_react and not want_view:
+            # Another shard owns this slice of the package; stay quiet.
+            continue
         short = []
-        if done["react"] < n_react:
-            short.append(f"reactions {done['react']}/{n_react}")
-        if done["view"] < n_views:
-            short.append(f"views {done['view']}/{n_views}")
+        if done["react"] < want_react:
+            short.append(f"reactions {done['react']}/{want_react}")
+        if done["view"] < want_view:
+            short.append(f"views {done['view']}/{want_view}")
         if short:
-            logger.warning(f"post {message_id}: SHORT — {', '.join(short)} "
-                           f"for {sub.get('client_name')} "
-                           f"({len(joined)} accounts in channel)")
+            if sharding_runtime_enabled():
+                logger.warning(f"post {message_id}: SHORT — {', '.join(short)} "
+                               f"for {sub.get('client_name')} (shard slice of "
+                               f"package {n_react} react / {n_views} view, "
+                               f"{len(joined)} accounts in channel fleet-wide)")
+            else:
+                logger.warning(f"post {message_id}: SHORT — {', '.join(short)} "
+                               f"for {sub.get('client_name')} "
+                               f"({len(joined)} accounts in channel)")
         else:
             logger.info(f"post {message_id}: {done['react']} reactions, "
                         f"{done['view']} views for {sub.get('client_name')}")
@@ -2457,6 +4371,60 @@ def audio_ready() -> bool:
     return TGCALLS_OK and os.path.exists(LIVE_AUDIO_PATH)
 
 
+async def validate_live_audio() -> Tuple[bool, str]:
+    """Verify Heroku has ffmpeg/ffprobe and the uploaded file has audio."""
+    global AUDIO_VALIDATION_CACHE
+    if not TGCALLS_OK:
+        return False, TGCALLS_ERR or "py-tgcalls is not installed"
+    if not os.path.exists(LIVE_AUDIO_PATH):
+        AUDIO_VALIDATION_CACHE = None
+        return False, "no audio file set"
+    try:
+        stat = os.stat(LIVE_AUDIO_PATH)
+        fingerprint = (stat.st_mtime_ns, stat.st_size)
+    except OSError as exc:
+        return False, str(exc)[:120]
+    if AUDIO_VALIDATION_CACHE:
+        old_mtime, old_size, old_valid, old_reason = AUDIO_VALIDATION_CACHE
+        if (old_mtime, old_size) == fingerprint:
+            return old_valid, old_reason
+
+    ffprobe = shutil.which("ffprobe")
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffprobe or not ffmpeg:
+        result = (False, f"ffmpeg/ffprobe missing (ffmpeg={ffmpeg}, ffprobe={ffprobe})")
+        AUDIO_VALIDATION_CACHE = (*fingerprint, *result)
+        return result
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            ffprobe, "-v", "error", "-select_streams", "a:0",
+            "-show_entries", "stream=codec_name", "-of", "default=nw=1:nk=1",
+            LIVE_AUDIO_PATH,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        if proc.returncode != 0 or not stdout.strip():
+            reason = stderr.decode(errors="replace").strip()[:180]
+            result = (False, reason or f"ffprobe exited with {proc.returncode}")
+        else:
+            result = (True, stdout.decode(errors="replace").strip().splitlines()[0])
+        AUDIO_VALIDATION_CACHE = (*fingerprint, *result)
+        return result
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        result = (False, "ffprobe timed out")
+    except ProcessLookupError:
+        result = (False, "ffprobe exited before it could be inspected")
+    except Exception as exc:
+        result = (False, f"{type(exc).__name__}: {str(exc)[:120]}")
+    AUDIO_VALIDATION_CACHE = (*fingerprint, *result)
+    return result
+
+
 def live_stream_source():
     """The looping MP3 every account feeds into a call."""
     return MediaStream(
@@ -2507,12 +4475,75 @@ def free_live_keys(keys: List[str], chat_id: Optional[int] = None) -> List[str]:
     """Those of `keys` that are online and not tied up in another call."""
     out = []
     for k in keys:
-        if not acc_client(k) or is_frozen(k):
+        # Dead, frozen and offline accounts cannot hold a stream: they would
+        # count against the stream limit and the client's package while sitting
+        # silently outside the call.
+        if not account_usable(k):
             continue
         busy = live_busy_in(k)
         if busy is None or busy == chat_id:
             out.append(k)
     return out
+
+
+def ordered_live_account_keys() -> List[str]:
+    """Stable account-ID order used by both the bot picker and web panel."""
+    if sharding_runtime_enabled() and ACCOUNT_SLOT_BY_KEY:
+        return sorted(
+            ACCOUNT_SLOT_BY_KEY,
+            key=lambda key: (ACCOUNT_SLOT_BY_KEY.get(key, 10**9), str(key)),
+        )
+    return sorted(acc_keys())
+
+
+async def live_selection_candidates() -> List[str]:
+    """Return account IDs that are not already streaming in another call.
+
+    The controller knows every account ID from the shard map. The live-state
+    collection adds the accounts currently held by other workers, so the list
+    shown to the owner is global instead of incorrectly showing only the local
+    worker's ten sessions.
+    """
+    busy = {key for keys in LIVE_AUDIO.values() for key in keys}
+    if col_live_state is not None:
+        try:
+            async for row in col_live_state.find({}, {"keys": 1}):
+                busy.update(str(key) for key in (row.get("keys") or []))
+        except Exception as exc:
+            logger.debug("live selection state unavailable: %s", exc)
+
+    ordered = ordered_live_account_keys()
+    online = None
+    if sharding_runtime_enabled() and col_account_shards is not None:
+        try:
+            online = set()
+            async for row in col_account_shards.find(
+                {"account_key": {"$exists": True}},
+                {"account_key": 1, "lease_until": 1},
+            ):
+                lease = row.get("lease_until")
+                if lease and lease > utcnow():
+                    online.add(str(row.get("account_key")))
+        except Exception as exc:
+            logger.debug("live account lease state unavailable: %s", exc)
+
+    return [key for key in ordered
+            if (online is None or key in online)
+            and key not in busy and not is_frozen(key)
+            and not account_known_dead(key)]
+
+
+def live_account_id_lines(keys: List[str], limit: int = 20) -> List[str]:
+    """Render a compact account-ID preview without overflowing Telegram."""
+    lines = []
+    for index, key in enumerate(keys[:limit], 1):
+        slot = ACCOUNT_SLOT_BY_KEY.get(key)
+        worker = f" <i>worker.{slot + 1}</i>" if slot is not None else ""
+        lines.append(f"<b>{index}.</b> <code>{esc(str(key))}</code>{worker}")
+    if len(keys) > limit:
+        lines.append(f"<i>+ {len(keys) - limit} more account IDs. "
+                     f"The first requested IDs are selected in this order.</i>")
+    return lines
 
 
 async def get_tgcalls(key: str):
@@ -2528,8 +4559,17 @@ async def get_tgcalls(key: str):
     async def _restart(_c, update):
         # -stream_loop covers ~everything, but if the count ever runs out the
         # account would go silent and get dropped, so start the file again.
+        chat_id = getattr(update, "chat_id", None)
+        marker_key = (key, chat_id)
+        stopped_at = INTENTIONAL_LIVE_STOPS.get(marker_key)
+        if stopped_at is not None:
+            if time.monotonic() - stopped_at < 60:
+                # This stream ended because the owner pressed Leave/Stop. Do
+                # not immediately rejoin the same voice chat.
+                return
+            INTENTIONAL_LIVE_STOPS.pop(marker_key, None)
         try:
-            await call.play(update.chat_id, live_stream_source())
+            await call.play(chat_id, live_stream_source())
         except Exception as e:
             logger.debug(f"stream restart {key}: {e}")
 
@@ -2538,17 +4578,33 @@ async def get_tgcalls(key: str):
     return call
 
 
+async def reset_tgcalls_bridge(key: str, chat_id: int):
+    """Discard a bridge whose ffmpeg/native process already exited."""
+    call = TGCALLS.pop(key, None)
+    if call is None:
+        return
+    try:
+        await call._binding.stop(chat_id)
+    except Exception:
+        pass
+    try:
+        executor = getattr(call, "executor", None)
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
+
+
 async def play_live_audio(key: str, chat_id: int) -> Tuple[bool, str]:
     """Put one account into `chat_id`'s call and start streaming the MP3.
 
-    play() performs the real WebRTC join itself, so no JoinGroupCallRequest is
-    sent here — issuing one would conflict, since Telegram permits a single
-    join per peer per call.
+    A failed native/ffmpeg process must not stay cached. The old bridge was
+    reused on every later Go Live attempt, which is why the same
+    ProcessLookupError repeated for every account.
     """
-    if not TGCALLS_OK:
-        return False, "py-tgcalls not installed"
-    if not os.path.exists(LIVE_AUDIO_PATH):
-        return False, "no audio file set"
+    valid, reason = await validate_live_audio()
+    if not valid:
+        return False, reason
     if key not in LIVE_AUDIO.get(chat_id, set()):
         busy = live_busy_in(key)
         if busy is not None:
@@ -2558,27 +4614,97 @@ async def play_live_audio(key: str, chat_id: int) -> Tuple[bool, str]:
         spare = fd_headroom()
         if spare < FD_HEADROOM:
             return False, f"only {spare} file descriptors left"
-    try:
-        call = await get_tgcalls(key)
-        if call is None:
-            return False, "account offline"
-        await call.play(chat_id, live_stream_source(),
-                        GroupCallConfig(auto_start=False))
-        LIVE_AUDIO.setdefault(chat_id, set()).add(key)
-        return True, ""
-    except Exception as e:
-        return False, f"{type(e).__name__}: {e}"[:80]
 
+    # A fresh owner-requested start cancels the previous leave marker for this
+    # account/chat pair, so a later natural stream-end can be restarted again.
+    INTENTIONAL_LIVE_STOPS.pop((key, chat_id), None)
+    for attempt in range(2):
+        try:
+            call = await get_tgcalls(key)
+            if call is None:
+                return False, "account offline"
+            await call.play(chat_id, live_stream_source(),
+                            GroupCallConfig(auto_start=False))
+            LIVE_AUDIO.setdefault(chat_id, set()).add(key)
+            return True, ""
+        except ProcessLookupError:
+            await reset_tgcalls_bridge(key, chat_id)
+            if attempt == 0:
+                await asyncio.sleep(0.5)
+                continue
+            return False, "audio/ffmpeg process exited; bridge reset"
+        except FileNotFoundError as exc:
+            await reset_tgcalls_bridge(key, chat_id)
+            return False, f"audio file/process not found: {exc}"[:120]
+        except Exception as exc:
+            await reset_tgcalls_bridge(key, chat_id)
+            return False, f"{type(exc).__name__}: {exc}"[:120]
+    return False, "audio bridge failed"
 
 async def stop_live_audio(key: str, chat_id: int):
+    """Leave one account from one call and always clear durable bookkeeping.
+
+    ``call.calls`` can fail while Telegram is closing a voice chat. The old
+    code treated that lookup failure as the end of the cleanup path, so the
+    account stayed in the native call even though the local set was cleared.
+    If the active-call lookup is unavailable, call ``leave_call`` directly; the
+    native layer treats an already-ended call as harmless.
+    """
+    # Suppress the automatic stream_end recovery callback for this deliberate
+    # leave. Without this marker, ntgcalls sees the leave as a failed stream and
+    # immediately starts the MP3 again.
+    INTENTIONAL_LIVE_STOPS[(key, chat_id)] = time.monotonic()
     call = TGCALLS.get(key)
     if call is not None:
+        active = None
         try:
-            await call.leave_call(chat_id)
-        except Exception as e:
-            logger.debug(f"leave call {key}: {e}")
+            active = await call.calls
+        except Exception as exc:
+            logger.debug("live call lookup failed for %s/%s: %s", key, chat_id, exc)
+
+        should_leave = active is None or chat_id in active
+        if should_leave:
+            try:
+                await call.leave_call(chat_id)
+            except Exception as exc:
+                # A call that disappeared between the lookup and leave is
+                # already gone. Do not block local/durable cleanup on it.
+                logger.debug("leave call %s/%s: %s", key, chat_id, exc)
+
     LIVE_AUDIO.get(chat_id, set()).discard(key)
     LIVE_SESSIONS.get(chat_id, {}).get("since", {}).pop(key, None)
+    await persist_live_state(chat_id)
+
+
+def live_state_id(chat_id: int) -> str:
+    """Use one durable live-state row per worker in sharded mode."""
+    if sharding_runtime_enabled():
+        return f"{chat_id}:worker.{WORKER_SLOT}"
+    return str(chat_id)
+
+
+async def persist_live_state(chat_id: int):
+    if col_live_state is None:
+        return
+    keys = list(LIVE_AUDIO.get(chat_id, set()))
+    document_id = live_state_id(chat_id)
+    if not keys:
+        await col_live_state.delete_one({"_id": document_id})
+        # Remove the pre-sharding single-row format once a worker has handled
+        # this call. Otherwise the old row can make the web panel show a ghost
+        # live stream and prevent an account from being selected again.
+        if sharding_runtime_enabled():
+            await col_live_state.delete_one({"_id": str(chat_id),
+                                             "worker_slot": {"$exists": False}})
+        return
+    sess = LIVE_SESSIONS.get(chat_id, {})
+    await col_live_state.update_one(
+        {"_id": document_id},
+        {"$set": {"chat_id": chat_id, "worker_slot": WORKER_SLOT,
+                  "keys": keys, "label": sess.get("label", ""),
+                  "target": sess.get("target", 0), "updated_at": utcnow()}},
+        upsert=True,
+    )
 
 
 def live_session(chat_id: int) -> dict:
@@ -2641,6 +4767,7 @@ async def join_live_with_audio(keys: List[str], chat_id: int,
         if i + LIVE_JOIN_BATCH < len(keys):
             await asyncio.sleep(random.uniform(0.8, 1.5))
 
+    await persist_live_state(chat_id)
     logger.info(f"live stream: {ok}/{len(keys)} accounts streaming audio"
                 + (f" for {label}" if label else ""))
     return ok, errors
@@ -2722,6 +4849,11 @@ async def process_live_stream_start(channel_id: int, call):
                 pass
         return
 
+    audio_valid, audio_reason = await validate_live_audio()
+    if not audio_valid:
+        logger.warning(f"live stream in {channel_id} cannot start audio — {audio_reason}")
+        return
+
     for sub in subs:
         if sub["expires_at"] < utcnow():
             await update_client_status(str(sub["_id"]), "expired")
@@ -2735,7 +4867,14 @@ async def process_live_stream_start(channel_id: int, call):
                            f"{n_live} -> {LIVE_CAP} (Audio > Stream Limit)")
             n_live = live_limit(n_live)
 
-        joined = [k for k in sub.get("joined_accounts", []) if acc_client(k)]
+        joined_all = globally_ordered_joined(sub.get("joined_accounts", []))
+        if sharding_runtime_enabled():
+            # Select the subscription's live package globally, then let each
+            # worker stream only the selected accounts it owns.
+            global_live = joined_all[:min(n_live, len(joined_all))]
+            joined = [k for k in global_live if local_worker_account(k)]
+        else:
+            joined = [k for k in joined_all if account_usable(k)]
 
         # Another client may already be live and holding some of these. An
         # account can only sit in one group call, so those are gone for now.
@@ -2747,7 +4886,7 @@ async def process_live_stream_start(channel_id: int, call):
         # it the client would silently get half the accounts they paid for —
         # while dozens of accounts sat idle in other channels. Take the
         # least-busy free ones, join them, and they are members from now on.
-        if len(free) < n_live:
+        if len(free) < n_live and not sharding_runtime_enabled():
             need = n_live - len(free)
             load = await account_load()
             spare = [k for k in free_live_keys(acc_keys(), channel_id)
@@ -2797,11 +4936,46 @@ async def live_keepalive_task():
         for chat_id, keys in list(LIVE_AUDIO.items()):
             call_live = await get_active_call(chat_id, list(keys))
             if call_live is None:
+                # Telegram has already removed the native call. Only clear our
+                # local bookkeeping; calling leave_call() here produces a
+                # native "Call not found, already removed" warning for every
+                # participant.
                 for key in list(keys):
-                    await stop_live_audio(key, chat_id)
+                    LIVE_AUDIO.get(chat_id, set()).discard(key)
+                    LIVE_SESSIONS.get(chat_id, {}).get("since", {}).pop(key, None)
                 end_live_session(chat_id)
+                await persist_live_state(chat_id)
                 logger.info(f"live stream ended in {chat_id} — accounts left")
                 continue
+
+            # Accounts that died or were frozen mid-stream are gone from the
+            # call but were still counted as streaming: they held a slot of the
+            # stream limit and of the client's package while delivering nothing.
+            ghosts = [k for k in list(keys)
+                      if not account_usable(k) or TGCALLS.get(k) is None]
+            for key in ghosts:
+                logger.warning(f"live {chat_id}: {key} is no longer usable — "
+                               f"pulled out of the stream")
+                await stop_live_audio(key, chat_id)
+                keys.discard(key)
+            if ghosts:
+                sess_now = LIVE_SESSIONS.get(chat_id) or {}
+                short = int(sess_now.get("target", 0)) - len(keys)
+                if short > 0:
+                    spare = [k for k in free_live_keys(sess_now.get("pool", []),
+                                                       chat_id)
+                             if k not in keys]
+                    if spare:
+                        extra, _ = await join_live_with_audio(
+                            random.sample(spare, min(short, len(spare))),
+                            chat_id)
+                        logger.info(f"live backfill {chat_id}: {extra} added "
+                                    f"(was {short} short of "
+                                    f"{sess_now.get('target')})")
+                if not keys:
+                    end_live_session(chat_id)
+                    await persist_live_state(chat_id)
+                    continue
 
             sess = LIVE_SESSIONS.get(chat_id)
             if LIVE_ROTATE and sess is not None:
@@ -2843,9 +5017,11 @@ async def get_active_call(channel_id: int, keys=None):
     shuffled: always asking the same one would put every one of those requests
     on a single account and eventually earn it a flood wait.
     """
-    pool = list(keys or acc_keys())
+    pool = list(keys or usable_keys())
     random.shuffle(pool)
     for key in pool:
+        if not account_usable(key):
+            continue
         client = acc_client(key)
         if not client:
             continue
@@ -2874,7 +5050,7 @@ async def livestream_watch_task():
                 # the full channel without an extra resolve round-trip.
                 pool = targets.setdefault(cid, [])
                 for k in s.get("joined_accounts", []):
-                    if k not in pool and acc_client(k):
+                    if k not in pool and account_usable(k):
                         pool.append(k)
 
             for chat_id, keys in targets.items():
@@ -2958,7 +5134,9 @@ async def setup_channel_monitors():
     wanted: set = set()
     per_channel: List[List[str]] = []
     for s in subs:
-        members = [k for k in s.get("joined_accounts", []) if acc_client(k)]
+        # Only accounts that can still talk to Telegram are worth a listener
+        # slot: a dead or frozen session delivers no updates at all.
+        members = [k for k in s.get("joined_accounts", []) if account_usable(k)]
         if members:
             per_channel.append(members)
 
@@ -2983,7 +5161,7 @@ async def setup_channel_monitors():
             break
 
     if not wanted:
-        wanted = set(acc_keys()[:MONITOR_CLIENTS])
+        wanted = set(usable_keys()[:MONITOR_CLIENTS])
 
     uncovered = [s.get("channel_link", "?") for s in subs
                  if s.get("joined_accounts")
@@ -3080,7 +5258,56 @@ async def expiry_check_task():
             logger.error(f"expiry task: {e}")
 
 
+async def global_account_totals() -> Optional[Tuple[int, int, int, int]]:
+    """Return (total sessions, leased accounts, shard count, live workers)."""
+    global _GLOBAL_ACCOUNT_TOTALS_CACHE
+    if not sharding_runtime_enabled() or col_account_shards is None:
+        return None
+
+    cached = _GLOBAL_ACCOUNT_TOTALS_CACHE
+    if cached and time.monotonic() - cached[0] < GLOBAL_ACCOUNT_TOTALS_CACHE_SECONDS:
+        return cached[1]
+
+    # One projected read is cheaper than the old count + count + distinct +
+    # find sequence, and it gives a consistent snapshot for the menu text.
+    now = utcnow()
+    docs = await col_account_shards.find(
+        {}, {"slot": 1, "owner": 1, "lease_until": 1}
+    ).to_list(length=None)
+    leased_accounts = sum(
+        1 for doc in docs
+        if doc.get("lease_until") and doc["lease_until"] > now
+    )
+    owners = {
+        doc.get("owner") for doc in docs
+        if doc.get("owner") and doc.get("lease_until")
+        and doc["lease_until"] > now
+    }
+    workers = max(
+        (int(doc.get("slot", 0) or 0) for doc in docs),
+        default=-1,
+    ) + 1
+    result = (len(docs), leased_accounts, workers, len(owners))
+    _GLOBAL_ACCOUNT_TOTALS_CACHE = (time.monotonic(), result)
+    return result
+
+
+async def available_account_count() -> int:
+    totals = await global_account_totals()
+    return totals[0] if totals is not None else joinable_count()
+
+
 # ═══════════════════════ SCREENS ═══════════════════════
+async def safe_callback_answer(event, text="", alert=False):
+    """Answer a callback if it is still fresh; expired taps are harmless."""
+    try:
+        await event.answer(text, alert=alert)
+    except QueryIdInvalidError:
+        logger.debug("callback query expired while answering: %s", text)
+    except Exception as exc:
+        logger.debug("callback answer failed: %s", exc)
+
+
 async def safe_edit(event, text, buttons=None):
     try:
         await event.edit(text, buttons=buttons)
@@ -3096,25 +5323,50 @@ async def safe_edit(event, text, buttons=None):
 
 async def show_menu(event, user_id, edit=True):
     online = acc_count()
+    account_line = f"{E_PERSON} {S('Accounts online')}: <b>{online}</b>"
+
+    async def client_counts():
+        try:
+            total = await col_clients.count_documents({})
+            active = await col_clients.count_documents({"status": "active"})
+            return total, active
+        except Exception:
+            return 0, 0
+
+    # These values are independent. Running them together prevents a slow Atlas
+    # round trip for one counter from delaying every other part of the menu.
+    global_totals, joins, client_total_pair = await asyncio.gather(
+        global_account_totals(), get_today_joins(), client_counts(),
+        return_exceptions=True,
+    )
+    if isinstance(global_totals, Exception):
+        logger.debug("global account totals unavailable: %s", global_totals)
+        global_totals = None
+    if isinstance(joins, Exception):
+        joins = 0
+    if isinstance(client_total_pair, Exception):
+        client_total_pair = (0, 0)
+    total_clients, active_subs = client_total_pair
+
+    if global_totals is not None:
+        total, leased_accounts, workers, live_workers = global_totals
+        online = total
+        account_line = (f"{E_PERSON} {S('Accounts total')}: <b>{total}</b> "
+                        f"<i>({leased_accounts} {S('accounts leased')}, "
+                        f"{live_workers}/{workers} {S('workers online')})</i>")
     problems = len(PROBLEM_SESSIONS)
-    joins = await get_today_joins()
-    try:
-        total_clients = await col_clients.count_documents({})
-        active_subs = await col_clients.count_documents({"status": "active"})
-    except Exception:
-        total_clients = active_subs = 0
 
     is_owner = user_id in OWNER_IDS
     text = card(E_ROCKET, "Reaction & Views Panel", [
-        f"{E_PERSON} {S('Accounts online')}: <b>{online}</b>"
-        + (f"  <i>({problems} {S('need review')})</i>" if problems else ""),
+        account_line
+        + (f"  <i>({problems} {S('need review on this worker')})</i>" if problems else ""),
         field(E_CROWN, "Clients", f"{active_subs} {S('active')} / {total_clients}"),
         field(E_CHART, "Joins today", str(joins)),
         field(E_CLOCK, "Uptime", uptime_str()),
         field(E_GREEN, "Status", S("Online 24/7")),
         "",
         f"{E_TARGET} {S('Choose an action below')}",
-    ], footer=f"{E_DIAMOND} {S('Sessions load from the sessions folder')}")
+    ], footer=f"{E_DIAMOND} {S('Sessions restore from MongoDB; local files are only a working cache')}")
 
     if is_owner:
         buttons = [
@@ -3149,40 +5401,52 @@ async def show_menu(event, user_id, edit=True):
         await event.respond(text, buttons=buttons)
 
 
-async def scan_dead_accounts() -> List[str]:
-    """Ping every connected account. Return keys of definitively dead ones."""
-    dead_keys: List[str] = []
+async def scan_dead_accounts() -> Tuple[List[str], List[str]]:
+    """Check every account against Telegram: (dead keys, frozen keys).
+
+    This used to send one updateStatus per account, which a frozen account
+    answers perfectly well and which says nothing about whether the login still
+    exists — so the scan reported "all accounts alive" while half the fleet
+    could not join anything. Each account is now asked with get_me(), the call
+    that answers None for a login Telegram no longer recognises, and a dead one
+    is taken out of the pool immediately.
+    """
+    dead: List[str] = []
+    frozen: List[str] = []
     for key in list(acc_keys()):
-        client = acc_client(key)
-        if not client:
+        if acc_client(key) is None:
             continue
-        try:
-            await client(UpdateStatusRequest(offline=False))
-        except Exception as e:
-            if is_dead_account_error(e):
-                ACCOUNTS[key].state = "dead"
-                dead_keys.append(key)
-            elif is_frozen_account_error(e):
-                # Frozen is not dead: the session is fine and must not be
-                # trashed, it just cannot join or invite anything.
-                mark_frozen(key)
-            else:
-                logger.debug(f"scan {key}: {e}")
+        state = await check_account_health(key)
+        if state == "dead":
+            dead.append(key)
+        elif state == "frozen":
+            frozen.append(key)
         await asyncio.sleep(0.2)
-    return dead_keys
+    if dead or frozen:
+        logger.warning(f"account scan: {len(dead)} dead, {len(frozen)} frozen")
+    return dead, frozen
 
 
 async def show_accounts_menu(event):
     online = acc_count()
     files = len([f for f in os.listdir(SESSIONS_DIR) if f.endswith(".session")])
-    dead = sum(1 for a in ACCOUNTS.values() if a.state == "dead")
+    shard_line = None
+    global_totals = await global_account_totals()
+    if global_totals is not None:
+        total, leased_accounts, workers, live_workers = global_totals
+        online = total
+        files = total
+        shard_line = field(E_REFRESH, "Workers", f"{live_workers}/{workers} online; {ACCOUNT_SHARD_SIZE} per shard")
+    dead = len(dead_keys()) + len(dead_problem_stems())
+    frozen = len(frozen_keys())
     text = card(E_PERSON, "Accounts", [
-        field(E_GREEN, "Online", str(online)),
-        field(E_PAGE, "Session files", str(files)),
-        field(E_WARN, "Need review", str(len(PROBLEM_SESSIONS))),
-        field(E_RED, "Detected dead", str(dead)),
-        field(E_LOCK, "Frozen (cannot join)", str(sum(1 for k in ACCOUNTS
-                                                      if is_frozen(k)))),
+        field(E_CHECK, "Usable on this worker", str(usable_count())),
+        field(E_GREEN, "Accounts total", str(online)),
+        field(E_PAGE, "Session files total", str(files)),
+        shard_line,
+        field(E_WARN, "Need review on this worker", str(len(PROBLEM_SESSIONS))),
+        field(E_RED, "Dead logins", str(dead)),
+        field(E_LOCK, "Frozen (cannot join)", str(frozen)),
         field(E_TRASH, "In trash", str(len(trash_entries()))),
     ], footer=f"{E_SHIELD} {S('Removing an account moves it to trash, never deletes it')}")
     buttons = [
@@ -3192,17 +5456,52 @@ async def show_accounts_menu(event):
          btn("Reload Folder", "reload_sessions", icon="🔄")],
         [btn("Needs Review", "problem_sessions", icon="⚠️"),
          btn("Remove Account", "remove_account", icon="🚫")],
-        [btn("Scan Dead Accounts", "scan_dead", icon="🔍"),
+        [btn("Scan Accounts", "scan_dead", icon="🔍"),
          btn("Trash", "trash_menu", icon="🗑")],
         [btn("Stop All Accounts", "acc_stop_all_ask", icon="⏸"),
-         btn("Remove All Dead", "acc_rm_dead_ask", icon="🚫")],
-        [btn("Sync To Client Channels", "sync_onboard", icon="🔗")],
+         btn("Trash Dead", "acc_rm_dead_ask", icon="🚫")],
+        [btn("Trash Frozen", "acc_rm_frozen_ask", icon="🧊"),
+         btn("Sync To Client Channels", "sync_onboard", icon="🔗")],
         [btn("Home", "home", icon="🏠")],
     ]
     await safe_edit(event, text, buttons)
 
 
 async def show_accounts_list(event, page=1):
+    if sharding_runtime_enabled() and col_account_shards is not None:
+        records = await col_account_shards.find({}).sort("_id", 1).to_list(length=None)
+        if not records:
+            return await safe_edit(event, card(E_CROSS, "No Accounts", [
+                S("No account shard has been registered yet."),
+            ]), kb_nav("menu_accounts"))
+        rows, page, total_pages = paginate(records, page)
+        lines, buttons = [], []
+        now = utcnow()
+        start = (page - 1) * PER_PAGE
+        for index, record in enumerate(rows, start + 1):
+            key = str(record.get("account_key") or record.get("_id", ""))
+            slot = int(record.get("slot", 0) or 0) + 1
+            lease = record.get("lease_until")
+            online = bool(lease and lease > now)
+            dot = "🟢" if online else "🟡"
+            lines.append(f"{dot} <b>{index}.</b> <code>{esc(key)}</code> "
+                         f"<i>worker.{slot}</i>")
+            local_key = key if key in ACCOUNTS else None
+            if local_key:
+                buttons.append([Button.inline(
+                    f"⚙ {ACCOUNTS[local_key].label[:15]}",
+                    f"acc_mgmt_{local_key}".encode())])
+            else:
+                buttons.append([Button.inline(
+                    f"{dot} worker.{slot} — {str(key)[:15]}", b"noop")])
+        buttons += pager(page, total_pages, "acc", "menu_accounts")
+        return await safe_edit(
+            event,
+            card(E_PERSON, "All Account Shards", lines,
+                 footer=field(E_CHART, "Total accounts", str(len(records)))),
+            buttons,
+        )
+
     keys = sorted(acc_keys())
     if not keys:
         return await safe_edit(event, card(E_CROSS, "No Accounts", [
@@ -3249,8 +5548,11 @@ async def show_problem_sessions(event, page=1):
         f"{E_LOCK} {S('Re-login sends a fresh OTP and replaces the session file.')} "
         f"{E_TRASH} {S('Trash moves it to the trash folder instead.')} "
         f"{S('A locked file usually means a second bot process is running.')}"))
+    # One bulk action prevents the owner from tapping dozens of callback buttons
+    # at once. Each callback query is short-lived; the old per-row approach
+    # expired while moving sessions to GridFS trash and produced QueryIdInvalid.
+    trash_buttons = [[btn("Move All to Trash", "prob_rm_all_ask", style="danger")]]
     # Re-login + Trash per session so the owner can fix or clean each one
-    trash_buttons = []
     for stem, _ in rows:
         trash_buttons.append([
             Button.inline(f"🔑 {esc(stem[:12])}", f"prob_login_{stem}".encode()),
@@ -3337,6 +5639,8 @@ async def show_live_now(event):
                          f"<b>{len(keys)}</b> {S('streaming')}"
                          + (f", {pool - len(keys)} {S('resting')}"
                             if pool > len(keys) else ""))
+            lines.append(f"{E_PERSON} <b>{S('Account IDs')}</b>")
+            lines += live_account_id_lines(sorted(keys), limit=20)
             buttons.append([btn(f"Stop {label[:14]}",
                                 f"live_stop_{chat_id}", icon="⏹"),
                             btn("Rotate", f"live_rotnow_{chat_id}", icon="🔄")])
@@ -3576,8 +5880,18 @@ async def show_stats(event):
     except Exception:
         spread = "-"
 
+    account_display = str(acc_count())
+    if global_totals := await global_account_totals():
+        account_display = (f"{global_totals[0]} total "
+                          f"({global_totals[1]} leased, "
+                          f"{global_totals[3]}/{global_totals[2]} workers)")
+
     text = card(E_CHART, "Statistics", [
-        field(E_PERSON, "Accounts online", str(acc_count())),
+        field(E_PERSON, "Accounts total", account_display),
+        field(E_CHECK, "Usable for work", str(usable_count())),
+        field(E_RED, "Dead logins", str(len(dead_keys())
+                                        + len(dead_problem_stems()))),
+        field(E_LOCK, "Frozen (cannot join)", str(len(frozen_keys()))),
         field(E_CHANNEL, "Channels per account", spread),
         field(E_WARN, "Sessions to review", str(len(PROBLEM_SESSIONS))),
         field(E_TRASH, "In trash", str(len(trash_entries()))),
@@ -3616,7 +5930,7 @@ async def show_help(event):
         f"  {S('Real view counter increment. Works on public and private posts.')}",
         "",
         f"{E_PERSON} <b>{S('Accounts')}</b>",
-        f"  {S('Sessions load from the sessions folder. Import a ZIP of .session files or log in by phone.')}",
+        f"  {S('Sessions restore from MongoDB. Import a ZIP of .session files or log in by phone; the local copy syncs automatically.')}",
         "",
         f"{E_PAGE} <b>{S('Link formats')}</b>",
         f"  <code>https://t.me/channel/123</code>",
@@ -3626,7 +5940,36 @@ async def show_help(event):
 
 
 # ═══════════════════════ BOT ═══════════════════════
-bot = TelegramClient(os.path.join(BASE_DIR, "bot_session"), API_ID, API_HASH)
+async def create_dashboard_token(owner_id: int) -> Optional[str]:
+    if col_dashboard_tokens is None:
+        return None
+    raw = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    await col_dashboard_tokens.insert_one({
+        "_id": token_hash,
+        "owner_id": int(owner_id),
+        "created_at": utcnow(),
+        "expires_at": utcnow() + datetime.timedelta(minutes=15),
+        "used": False,
+    })
+    base = DASHBOARD_URL or (
+        f"https://{HEROKU_APP_NAME}.herokuapp.com" if HEROKU_APP_NAME else ""
+    )
+    if not base:
+        return None
+    return f"{base}/auth/{raw}"
+
+
+# ═══════════════════════ BOT ═══════════════════════
+# The bot account is authenticated by BOT_TOKEN, so it does not need a local
+# SQLite file. A MemorySession prevents Telethon from opening
+# bot_session.session during module import and then colliding with the GridFS
+# restore on Heroku. User-account sessions remain fully persistent in MongoDB.
+# Telethon validates api_id/hash at client construction time. Use harmless
+# placeholders only so static tooling can import this module without env vars;
+# main() refuses to start until the real Config Vars are present.
+bot = TelegramClient(MemorySession(), API_ID or 1,
+                     API_HASH or "missing-api-hash")
 bot.parse_mode = "html"
 
 
@@ -3647,6 +5990,23 @@ async def cmd_start(event):
 async def cmd_id(event):
     await event.respond(card(E_PERSON, "Your ID", [
         f"<code>{event.sender_id}</code>",
+    ]))
+
+
+@bot.on(events.NewMessage(pattern=r"^/dashboard$"))
+async def cmd_dashboard(event):
+    if event.sender_id not in OWNER_IDS:
+        return await event.respond(card(E_LOCK, "Owner Only", [S("Not allowed.")]))
+    link = await create_dashboard_token(event.sender_id)
+    if not link:
+        return await event.respond(card(E_WARN, "Dashboard URL Missing", [
+            S("Set DASHBOARD_URL or HEROKU_APP_NAME in Heroku Config Vars first."),
+        ]))
+    await event.respond(card(E_CHECK, "Dashboard Login", [
+        S("Open this one-time dashboard link within 15 minutes:"),
+        f"<code>{esc(link)}</code>",
+        "",
+        S("Do not forward this link. It expires after one use or 15 minutes."),
     ]))
 
 
@@ -3709,6 +6069,7 @@ async def on_callback(event):
 
     data = event.data.decode()
     owner = uid in OWNER_IDS
+    started = time.monotonic()
     logger.info(f"cb {uid}: {data}")
 
     try:
@@ -3721,6 +6082,10 @@ async def on_callback(event):
             await event.answer(f"Error: {str(e)[:150]}", alert=True)
         except Exception:
             pass
+    finally:
+        elapsed = time.monotonic() - started
+        if elapsed >= 2:
+            logger.warning("callback %s took %.1fs", data, elapsed)
 
 
 OWNER_ONLY = {
@@ -3728,7 +6093,8 @@ OWNER_ONLY = {
     "add_string", "import_zip", "remove_account", "reload_sessions",
     "problem_sessions", "trash_menu", "trash_restore", "trash_clear_ask",
     "trash_clear_do", "scan_dead", "acc_stop_all_ask", "acc_stop_all_do",
-    "acc_rm_dead_ask", "acc_rm_dead_do", "approve", "stats", "sync_onboard",
+    "acc_rm_dead_ask", "acc_rm_dead_do", "acc_rm_frozen_ask",
+    "acc_rm_frozen_do", "approve", "stats", "sync_onboard",
     "join_all_clients", "join_all_do",
     "leave_all", "exec_leave_all",
     "go_live", "audio_menu", "audio_set", "audio_del", "live_stop_all",
@@ -3772,18 +6138,61 @@ async def route_callback(event, uid, owner, data):
     if data.startswith("prob_login_"):
         return await start_relogin(event, data[len("prob_login_"):])
 
+    # ── Bulk remove problem sessions ──────────────────────────
+    if data == "prob_rm_all_ask":
+        count = len(PROBLEM_SESSIONS)
+        return await safe_edit(event, card(E_WARN, "Move All to Trash", [
+            field(E_TRASH, "Problem sessions", str(count)),
+            "",
+            S("Only sessions currently shown in Needs Review will be moved."),
+            S("Healthy account sessions will not be touched."),
+            S("Clients and subscriptions are preserved; sessions can be restored from Trash."),
+        ]), [[btn("Yes, move all", "prob_rm_all_do", style="danger"),
+              btn("Cancel", "problem_sessions", icon="↩️")]])
+
+    if data == "prob_rm_all_do":
+        global _PROBLEM_PURGE_RUNNING
+        if _PROBLEM_PURGE_RUNNING:
+            return await safe_callback_answer(event, "Bulk removal is already running")
+        _PROBLEM_PURGE_RUNNING = True
+        # Acknowledge before the MongoDB bulk delete. It is fast, but the
+        # callback must still be answered before any network operation.
+        await safe_callback_answer(event, "Deleting all account sessions...")
+        try:
+            # Disconnect any account that survived the scan before deleting its
+            # local/remote session file.
+            for key in list(acc_keys()):
+                await disconnect_account(key)
+            problem_stems = list(PROBLEM_SESSIONS)
+            result = await move_problem_session_storage_to_trash(problem_stems)
+            PROBLEM_SESSIONS.clear()
+            invalidate_peer_cache()
+            await setup_channel_monitors()
+            return await safe_edit(event, card(E_CHECK, "Problem Sessions Moved", [
+                field(E_TRASH, "Entries moved", str(result["entries"])),
+                field(E_PAGE, "GridFS files moved", str(result["files"])),
+                field(E_PERSON, "Healthy accounts kept", str(acc_count())),
+                "",
+                S("Only Needs Review sessions were moved to trash."),
+                S("Clients, subscriptions and healthy account sessions were preserved."),
+            ]), [[btn("Accounts", "menu_accounts", icon="👤"),
+                   btn("Trash", "trash_menu", icon="🗑")],
+                  [btn("Home", "home", icon="🏠")]])
+        finally:
+            _PROBLEM_PURGE_RUNNING = False
+
     # ── Remove a single problem session ───────────────────────
     if data.startswith("prob_rm_"):
         stem = data[len("prob_rm_"):]
-        reason = PROBLEM_SESSIONS.get(stem, "unknown")
         sess_path = os.path.join(SESSIONS_DIR, stem + ".session")
+        await safe_callback_answer(event, "Removing...")
         if os.path.exists(sess_path):
-            moved = to_trash(sess_path)
+            moved = await to_trash(sess_path)
             PROBLEM_SESSIONS.pop(stem, None)
-            await event.answer(f"Moved to trash ({moved} file(s))")
+            logger.info("Moved %s to trash (%s file(s))", stem, moved)
         else:
             PROBLEM_SESSIONS.pop(stem, None)
-            await event.answer("Entry cleared (file not found)")
+            logger.info("Cleared missing problem session %s", stem)
         return await show_problem_sessions(event, 1)
 
     # ── Per-account management ────────────────────────────────
@@ -3907,7 +6316,7 @@ async def route_callback(event, uid, owner, data):
         if not acc:
             return await event.answer("Account not found", alert=True)
         await disconnect_account(key)
-        moved = to_trash(acc.path)
+        moved = await to_trash(acc.path)
         ACCOUNTS.pop(key, None)
         invalidate_peer_cache()
         logger.info(f"removed {key}: {moved} file(s) -> trash")
@@ -3918,7 +6327,7 @@ async def route_callback(event, uid, owner, data):
         return await show_trash(event)
 
     if data == "trash_restore":
-        n = restore_from_trash()
+        n = await restore_from_trash()
         await event.answer(f"{n} restored")
         if n:
             await load_all_sessions()
@@ -3949,6 +6358,7 @@ async def route_callback(event, uid, owner, data):
                 if os.path.exists(p):
                     try:
                         os.unlink(p)
+                        await storage_delete(_storage_name("trash", os.path.basename(p)))
                         deleted += 1
                     except Exception as e:
                         logger.warning(f"clear trash {p}: {e}")
@@ -3957,25 +6367,44 @@ async def route_callback(event, uid, owner, data):
 
     if data == "scan_dead":
         await safe_edit(event, card(E_REFRESH, "Scanning Accounts",
-                                    [S("Pinging all connected accounts — please wait...")]))
-        dead_keys = await scan_dead_accounts()
-        if not dead_keys:
+                                    [S("Asking Telegram about every account "
+                                       "— please wait...")]))
+        dead_list, frozen_list = await scan_dead_accounts()
+        if not dead_list and not frozen_list:
             return await safe_edit(event, card(E_CHECK, "All Accounts Alive", [
                 field(E_GREEN, "Accounts scanned", str(acc_count())),
+                field(E_LOCK, "Frozen", "0"),
                 "",
-                S("No frozen or dead account found."),
+                S("Every login still answers Telegram and none is frozen."),
             ]), kb_nav("menu_accounts"))
-        lines = [f"{E_RED} <code>{esc(k)}</code>" for k in dead_keys[:15]]
-        if len(dead_keys) > 15:
-            lines.append(f"<i>+ {len(dead_keys) - 15} more</i>")
-        return await safe_edit(event, card(E_WARN, "Dead Accounts Found", lines + [
+        lines = []
+        if dead_list:
+            lines += [f"{E_RED} <code>{esc(k)}</code> — {S('dead')}"
+                      for k in dead_list[:12]]
+            if len(dead_list) > 12:
+                lines.append(f"<i>+ {len(dead_list) - 12} {S('more dead')}</i>")
+        if frozen_list:
+            lines += [f"{E_LOCK} <code>{esc(k)}</code> — {S('frozen')}"
+                      for k in frozen_list[:12]]
+            if len(frozen_list) > 12:
+                lines.append(f"<i>+ {len(frozen_list) - 12} {S('more frozen')}</i>")
+        skip_note = S("Dead and frozen accounts are already skipped by every "
+                      "job — trashing only moves the file out of the folder, "
+                      "and trash can be restored.")
+        buttons = []
+        if dead_list:
+            buttons.append([btn("Trash Dead", "acc_rm_dead_ask", style="danger")])
+        if frozen_list:
+            buttons.append([btn("Trash Frozen", "acc_rm_frozen_ask", style="danger")])
+        buttons.append([btn("Back", "menu_accounts", icon="⬅️")])
+        return await safe_edit(event, card(E_WARN, "Account Scan Result", lines + [
             "",
-            field(E_RED, "Dead / frozen", str(len(dead_keys))),
-            field(E_GREEN, "Still alive", str(acc_count() - len(dead_keys))),
+            field(E_RED, "Dead logins", str(len(dead_list))),
+            field(E_LOCK, "Frozen (temporary)", str(len(frozen_list))),
+            field(E_GREEN, "Usable now", str(usable_count())),
             "",
-            f"{E_SHIELD} {S('Use Remove All Dead to trash them.')}",
-        ]), [[btn("Remove All Dead", "acc_rm_dead_ask", style="danger"),
-              btn("Back", "menu_accounts", icon="⬅️")]])
+            f"{E_SHIELD} {skip_note}",
+        ]), buttons)
 
     if data == "acc_stop_all_ask":
         return await safe_edit(event, card(E_WARN, "Stop All Accounts", [
@@ -3997,31 +6426,85 @@ async def route_callback(event, uid, owner, data):
         return await show_accounts_menu(event)
 
     if data == "acc_rm_dead_ask":
-        dead_keys = [k for k, a in ACCOUNTS.items() if a.state == "dead"]
-        if not dead_keys:
-            await event.answer("No dead accounts found. Run Scan Dead first.", alert=True)
+        dead_note = S("A deleted Telegram account cannot be recovered, but the "
+                      "file is only moved, never erased.")
+        registered = dead_keys()
+        unregistered = dead_problem_stems()
+        total = len(registered) + len(unregistered)
+        if not total:
+            await event.answer("No dead account found. Run Scan Accounts first.",
+                               alert=True)
             return await show_accounts_menu(event)
-        return await safe_edit(event, card(E_WARN, "Remove All Dead Accounts", [
-            field(E_RED, "Dead accounts to remove", str(len(dead_keys))),
+        lines = [f"{E_RED} <code>{esc(k)}</code>" for k in registered[:10]]
+        lines += [f"{E_RED} <code>{esc(s)}</code> <i>(file)</i>"
+                  for s in unregistered[:10]]
+        if total > len(lines):
+            lines.append(f"<i>+ {total - len(lines)} {S('more')}</i>")
+        return await safe_edit(event, card(E_WARN, "Trash Dead Accounts", lines + [
+            "",
+            field(E_RED, "Registered dead", str(len(registered))),
+            field(E_PAGE, "Dead files not loaded", str(len(unregistered))),
             "",
             f"{E_SHIELD} {S('Session files move to trash — not permanently deleted.')}",
+            f"{E_WARN} {dead_note}",
         ]), [[btn("Yes, trash them all", "acc_rm_dead_do", style="danger"),
               btn("Cancel", "menu_accounts", icon="↩️")]])
 
     if data == "acc_rm_dead_do":
-        dead_keys = [k for k, a in ACCOUNTS.items() if a.state == "dead"]
         removed = 0
-        for key in dead_keys:
+        for key in dead_keys():
             acc = ACCOUNTS.get(key)
             if not acc:
                 continue
             await disconnect_account(key)
-            to_trash(acc.path)
+            if await to_trash(acc.path):
+                removed += 1
             ACCOUNTS.pop(key, None)
-            removed += 1
+            PROBLEM_SESSIONS.pop(acc.stem, None)
+        for stem in dead_problem_stems():
+            path = os.path.join(SESSIONS_DIR, stem + ".session")
+            if os.path.exists(path) and await to_trash(path):
+                removed += 1
+            PROBLEM_SESSIONS.pop(stem, None)
         invalidate_peer_cache()
         await setup_channel_monitors()
-        await event.answer(f"Trashed {removed} dead account(s)")
+        await event.answer(f"Trashed {removed} dead file(s)")
+        return await show_accounts_menu(event)
+
+    if data == "acc_rm_frozen_ask":
+        freeze_note = S("A freeze is usually lifted by Telegram after a few "
+                        "days, and the session still works for reactions.")
+        freeze_back = S("Trashing moves the file to trash — Restore brings it "
+                        "straight back.")
+        frozen = frozen_keys()
+        if not frozen:
+            await event.answer("No frozen account right now. Run Scan Accounts.",
+                               alert=True)
+            return await show_accounts_menu(event)
+        return await safe_edit(event, card(E_LOCK, "Trash Frozen Accounts", [
+            field(E_LOCK, "Frozen accounts", str(len(frozen))),
+        ] + [f"{E_LOCK} <code>{esc(k)}</code>" for k in frozen[:10]] + [
+            "",
+            f"{E_WARN} {freeze_note}",
+            f"{E_SHIELD} {freeze_back}",
+        ]), [[btn("Yes, trash them", "acc_rm_frozen_do", style="danger"),
+              btn("Cancel", "menu_accounts", icon="↩️")]])
+
+    if data == "acc_rm_frozen_do":
+        removed = 0
+        for key in frozen_keys():
+            acc = ACCOUNTS.get(key)
+            if not acc:
+                continue
+            await disconnect_account(key)
+            FROZEN_ACCOUNTS.pop(key, None)
+            if await to_trash(acc.path):
+                removed += 1
+            ACCOUNTS.pop(key, None)
+            PROBLEM_SESSIONS.pop(acc.stem, None)
+        invalidate_peer_cache()
+        await setup_channel_monitors()
+        await event.answer(f"Trashed {removed} frozen file(s)")
         return await show_accounts_menu(event)
 
     if data == "sync_onboard":
@@ -4064,7 +6547,7 @@ async def route_callback(event, uid, owner, data):
         return await safe_edit(event, card(E_PLUS, "Add Account", [
             S("Log in with a phone number, or paste a Telethon string session."),
             "",
-            f"{E_SHIELD} {S('Either way the login is saved into the sessions folder.')}",
+            f"{E_SHIELD} {S('Either way the login is saved in MongoDB and restored after a dyno restart.')}",
         ]), [[btn("Phone Login", "add_phone", icon="📱"),
               btn("String Session", "add_string", icon="🔑")],
              [btn("Back", "menu_accounts", icon="⬅️")]])
@@ -4369,6 +6852,15 @@ async def route_callback(event, uid, owner, data):
              [btn("Cancel", "leave", icon="↩️")]])
 
     if data == "exec_leave_all":
+        if sharding_runtime_enabled():
+            task_id = await enqueue_internal_worker_fanout(
+                "leave_all", {"by": "bot"})
+            await event.answer("Leave sent to all account workers")
+            return await safe_edit(event, card(E_REFRESH, "Leave All Queued", [
+                field(E_REFRESH, "Task", str(task_id)),
+                "",
+                S("Every worker will leave all chats for its own account IDs."),
+            ]), kb_nav())
         await safe_edit(event, card(E_REFRESH, "Working", [S("Starting...")]))
         return await execute_leave_all(event)
 
@@ -4392,6 +6884,7 @@ async def route_callback(event, uid, owner, data):
     if data == "audio_del":
         try:
             os.unlink(LIVE_AUDIO_PATH)
+            await storage_delete("audio/live.mp3")
             await event.answer("Audio removed")
         except FileNotFoundError:
             await event.answer("No audio was set")
@@ -4452,6 +6945,17 @@ async def route_callback(event, uid, owner, data):
         return await show_live_now(event)
 
     if data == "live_stop_all":
+        if sharding_runtime_enabled():
+            task_id = await enqueue_internal_worker_fanout(
+                "live_stop", {"by": "bot"})
+            await event.answer("Stop sent to all account workers")
+            return await safe_edit(event, card(E_REFRESH, "Stopping Live Calls", [
+                field(E_REFRESH, "Task", str(task_id)),
+                "",
+                S("Every worker is removing its own accounts from the call."),
+                S("Open Live Now again after a few seconds to verify."),
+            ]), [[btn("Live Now", "live_now", icon="🎤")],
+                 [btn("Home", "home", icon="🏠")]])
         n = 0
         for chat, keys in list(LIVE_AUDIO.items()):
             for key in list(keys):
@@ -4464,6 +6968,17 @@ async def route_callback(event, uid, owner, data):
     # Pull every account out of one specific call, leaving other calls running.
     if data.startswith("live_stop_"):
         chat = int(data[len("live_stop_"):])
+        if sharding_runtime_enabled():
+            task_id = await enqueue_internal_worker_fanout(
+                "live_stop", {"chat_id": chat, "by": "bot"})
+            await event.answer("Stop sent to all account workers")
+            return await safe_edit(event, card(E_REFRESH, "Stopping Stream", [
+                field(E_CHANNEL, "Channel", str(chat)),
+                field(E_REFRESH, "Task", str(task_id)),
+                "",
+                S("Every worker is removing its own accounts from this call."),
+            ]), [[btn("Live Now", "live_now", icon="🎤")],
+                 [btn("Home", "home", icon="🏠")]])
         keys = list(LIVE_AUDIO.get(chat, set()))
         for key in keys:
             await stop_live_audio(key, chat)
@@ -4522,7 +7037,7 @@ async def handle_qty(event, data):
         return await show_menu(event, event.sender_id)
 
     prefix, _, choice = data.rpartition("_")
-    total = acc_count()
+    total = fleet_account_count()
 
     if choice == "custom":
         state["step"] = "custom_qty"
@@ -4541,6 +7056,27 @@ async def handle_qty(event, data):
 
 async def run_task(event, state, count):
     t = state["type"]
+    if sharding_runtime_enabled() and t in {"join", "react_view", "multi_react", "views"}:
+        task_ids = []
+        if t == "join":
+            for info in state["links_data"]:
+                task_ids.append(await enqueue_internal_worker_fanout(
+                    "join", {"target": info["link"], "limit": count}))
+        elif t in {"react_view", "multi_react"}:
+            emojis = state.get("emojis") if t == "multi_react" else [state.get("emoji", "")]
+            for info in state["links_data"]:
+                task_ids.append(await enqueue_internal_worker_fanout(
+                    "react", {"target": info["link"], "emojis": emojis, "limit": count}))
+        elif t == "views":
+            for link in state["links"]:
+                task_ids.append(await enqueue_internal_worker_fanout(
+                    "views", {"target": link, "limit": count}))
+        return await event.respond(card(E_CHECK, "Task Queued", [
+            field(E_PERSON, "Accounts across workers", str(count)),
+            field(E_REFRESH, "Tasks", str(len(task_ids))),
+            "",
+            S("Each worker will use only its assigned accounts."),
+        ]), buttons=kb_nav())
     if t == "join":
         await execute_join(event, state, count)
     elif t == "react_view":
@@ -4579,7 +7115,7 @@ def upgrade_prompt(doc: dict, step: str) -> str:
         # instead of backing out to the home screen to look it up.
         head = [f"{S(pos)} {DOT} {S(label)}",
                 "",
-                field(E_GREEN, "Accounts online", str(acc_count())),
+                field(E_GREEN, "Accounts across workers", str(fleet_account_count())),
                 field(icon, "Current", str(current))]
         return card(icon, "Upgrade Package", head + extra + [
             "",
@@ -4664,9 +7200,9 @@ def upgrade_summary(state) -> str:
     if need > n_acc:
         warn.append(f"{E_WARN} {S('Accounts raised to')} <b>{need}</b> "
                     f"{S('so reactions and views fit.')}")
-    if need > acc_count():
-        warn.append(f"{E_WARN} {S('Only')} <b>{acc_count()}</b> "
-                    f"{S('accounts are online — the rest cannot join yet.')}")
+    if need > fleet_account_count():
+        warn.append(f"{E_WARN} {S('Only')} <b>{fleet_account_count()}</b> "
+                    f"{S('accounts are available across workers — the rest cannot join yet.')}")
     if not changed:
         warn.append(f"{E_CROSS} {S('Nothing would change.')}")
 
@@ -4761,6 +7297,8 @@ async def apply_upgrade(event, state):
     task_states.pop(event.chat_id, None)
     invalidate_peer_cache()
     await setup_channel_monitors()
+    if sharding_runtime_enabled():
+        await enqueue_internal_worker_fanout("onboard", {"subscription_id": cid})
 
     fresh = await get_client_doc(cid)
     receipt = card(E_CHECK, "Package Upgraded", [
@@ -4863,6 +7401,8 @@ async def on_message(event):
             # Only replace the live file once the download finished, so a
             # failed transfer cannot leave accounts with a truncated track.
             os.replace(tmp, LIVE_AUDIO_PATH)
+            await storage_put_path("audio/live.mp3", LIVE_AUDIO_PATH, kind="audio",
+                                   force=True)
             size = os.path.getsize(LIVE_AUDIO_PATH) / (1024 * 1024)
         except Exception as e:
             return await msg.edit(card(E_CROSS, "Save Failed", [
@@ -5138,13 +7678,22 @@ async def route_message(event, state, text):
     # ── leave one ─────────────────────────────────────────────
     if t == "leave_specific":
         task_states.pop(chat_id, None)
+        if sharding_runtime_enabled():
+            task_id = await enqueue_internal_worker_fanout(
+                "leave", {"target": text, "by": "bot"})
+            return await event.respond(card(E_CHECK, "Leave Queued", [
+                field(E_CHANNEL, "Target", esc(text[:80])),
+                field(E_REFRESH, "Task", str(task_id)),
+                "",
+                S("Every worker will remove its own account IDs."),
+            ]), buttons=kb_nav())
         return await execute_leave_specific(event, text)
 
 
 async def finish_custom_qty(event, state, text):
     if not text.isdigit() or int(text) < 1:
         return await bad(event, "Send a whole number of accounts.")
-    count = min(int(text), acc_count())
+    count = min(int(text), fleet_account_count())
     task_states.pop(event.chat_id, None)
     await run_task(event, state, count)
 
@@ -5155,24 +7704,55 @@ async def flow_go_live(event, state, text):
         ltype, target = parse_target(text)
         if ltype not in ("public", "private"):
             return await bad(event, "That is not a valid channel link.", "home")
+        candidates = await live_selection_candidates()
         state.update({"link": text.strip(), "ltype": ltype, "target": target,
-                      "step": "count"})
-        return await event.respond(card(E_PERSON, "Go Live", [
+                      "live_candidates": candidates, "step": "count"})
+        available = len(candidates)
+        preview = live_account_id_lines(candidates)
+        lines = [
             field(E_CHANNEL, "Channel", esc(text.strip())),
-            field(E_GREEN, "Accounts online", str(acc_count())),
-            field(E_CHECK, "Free for live", str(len(free_live_keys(acc_keys())))),
+            field(E_GREEN, "Free accounts", str(available)),
+            field(E_CHECK, "Accounts per worker", str(ACCOUNT_SHARD_SIZE)),
             field(E_SHIELD, "Stream limit", cap_text()),
             field(E_REFRESH, "Rotation", rotate_text()),
             "",
-            f"{S('How many accounts should join the live stream?')} "
-            f"(1-{live_limit(joinable_count())})",
-        ]), buttons=[[btn("Cancel", "home", icon="↩️")]])
+            f"{E_PERSON} <b>{S('Available account IDs')}</b>",
+        ]
+        lines += preview or [S("No free account is available right now.")]
+        lines += ["", f"{S('Send how many of the IDs above should join')} "
+                  f"(1-{live_limit(available)})."]
+        return await event.respond(card(E_PERSON, "Go Live", lines),
+                                    buttons=[[btn("Cancel", "home", icon="↩️")]])
 
     if state["step"] == "count":
         if not text.isdigit() or int(text) < 1:
             return await bad(event, "Send a whole number.", "home")
-        n = live_limit(min(int(text), joinable_count()))
+        candidates = await live_selection_candidates()
+        requested = int(text)
+        n = live_limit(min(requested, len(candidates)))
+        if n < 1:
+            return await bad(event, "No free account is available for this live.", "home")
+        selected = candidates[:n]
         task_states.pop(event.chat_id, None)
+        selected_lines = live_account_id_lines(selected, limit=20)
+        if sharding_runtime_enabled():
+            task_id = await enqueue_internal_worker_fanout(
+                "manual_live", {"target": state["link"], "count": n,
+                                 "keys": selected, "by": "bot"})
+            return await event.respond(card(E_CHECK, "Live Queued", [
+                field(E_PERSON, "Selected accounts", str(n)),
+                field(E_REFRESH, "Task", str(task_id)),
+                "",
+                f"{E_PERSON} <b>{S('Selected account IDs')}</b>",
+                *selected_lines,
+                "",
+                S("Each worker will use only the selected IDs it owns."),
+            ]), buttons=[[btn("Live Now", "live_now", icon="🎤"),
+                         btn("Home", "home", icon="🏠")]])
+        # Keep extra IDs as the rotation pool, but the first n IDs are the
+        # streamers shown to the owner.
+        pool_count = n * LIVE_POOL_MULT if LIVE_ROTATE else n
+        state["selected_keys"] = candidates[:pool_count]
         return await execute_go_live(event, state, n)
 
 
@@ -5181,6 +7761,15 @@ async def execute_go_live(event, state, count):
         S("Finding the live stream..."),
     ]))
 
+    audio_valid, audio_reason = await validate_live_audio()
+    if not audio_valid:
+        return await msg.edit(card(E_WARN, "Live Audio Unavailable", [
+            f"<code>{esc(audio_reason)}</code>",
+            "",
+            S("Check the ffmpeg buildpack and upload a valid audio file."),
+        ]), buttons=[[btn("Audio Menu", "audio_menu", icon="🎵")],
+                     [btn("Home", "home", icon="🏠")]])
+
     # Resolving needs a member, so join the channel first where necessary.
     # With rotation on, pull extra accounts into the channel as well: they stay
     # out of the call and become the pool to swap the tired ones for.
@@ -5188,9 +7777,15 @@ async def execute_go_live(event, state, count):
     # Least-busy first so a Go Live does not lean on the accounts that are
     # already carrying the most client channels.
     load = await account_load()
-    candidates = free_live_keys(acc_keys())
-    random.shuffle(candidates)
-    candidates.sort(key=lambda k: load.get(k, 0))
+    preselected = [str(key) for key in (state.get("selected_keys") or [])]
+    if preselected:
+        # The owner has already seen these IDs in the picker. Do not silently
+        # replace them with different accounts if one becomes unavailable.
+        candidates = free_live_keys(preselected)
+    else:
+        candidates = free_live_keys(acc_keys())
+        random.shuffle(candidates)
+        candidates.sort(key=lambda k: load.get(k, 0))
     pool_size = min(len(candidates),
                     count * LIVE_POOL_MULT if LIVE_ROTATE else count)
     keys = candidates[:pool_size]
@@ -5209,8 +7804,12 @@ async def execute_go_live(event, state, count):
     frozen_hit = 0
 
     for key in keys:
+        # Frozen, dead and offline accounts cannot join a call — skipping them
+        # here is what stops a Go Live spending its batch on unusable sessions.
+        if not account_usable(key):
+            continue
         client = acc_client(key)
-        if not client or is_frozen(key):
+        if client is None:
             continue
         try:
             ent = None
@@ -5239,23 +7838,22 @@ async def execute_go_live(event, state, count):
             chat_id = utils.get_peer_id(ent)
             usable.append(key)
         except Exception as e:
-            if is_frozen_account_error(e):
-                mark_frozen(key)
+            if await note_account_error(key, e):
                 frozen_hit += 1
             else:
                 logger.warning(f"go live join {key}: {type(e).__name__}: {e}")
         await asyncio.sleep(0.3)
 
     if frozen_hit:
-        logger.warning(f"go live: {frozen_hit} frozen account(s) skipped")
+        logger.warning(f"go live: {frozen_hit} frozen/dead account(s) skipped")
 
     if chat_id is None or not usable:
         lines = [S("No account could join or resolve that channel.")]
         if frozen_hit:
             lines += ["",
-                      field(E_WARN, "Frozen accounts", str(frozen_hit)),
-                      S("Those accounts are frozen by Telegram and cannot join "
-                        "anything. Add fresh accounts.")]
+                      field(E_WARN, "Frozen or dead", str(frozen_hit)),
+                      S("Telegram refuses joins from those accounts. They are "
+                        "already skipped everywhere; add fresh accounts.")]
         return await msg.edit(card(E_CROSS, "Cannot Reach Channel", lines),
                               buttons=kb_nav("home"))
 
@@ -5278,7 +7876,10 @@ async def execute_go_live(event, state, count):
     ok, errors = await join_live_with_audio(streamers, chat_id, state["link"])
 
     lines = [field(E_CHANNEL, "Channel", esc(state["link"])),
-             field(E_CHECK, "Streaming", f"{ok} / {len(streamers)}")]
+             field(E_CHECK, "Streaming", f"{ok} / {len(streamers)}"),
+             "",
+             f"{E_PERSON} <b>{S('Account IDs in this live')}</b>"]
+    lines += live_account_id_lines(streamers, limit=20)
     if LIVE_ROTATE:
         lines.append(field(E_REFRESH, "Rotation",
                            f"{rotate_text()} ({len(usable)} {S('in pool')})"))
@@ -5433,6 +8034,7 @@ async def finish_login(event, state):
     write_meta(path, api_id=API_ID, api_hash=API_HASH, phone=state["phone"],
                user_id=getattr(me, "id", 0), first_name=getattr(me, "first_name", ""),
                **ANDROID_PROFILE)
+    await persist_session_bundle(path)
     # hand the live client over to the store without reopening the file
     stem = os.path.splitext(os.path.basename(path))[0]
     acc = Account(stem, path, API_ID, API_HASH, dict(ANDROID_PROFILE))
@@ -5466,7 +8068,7 @@ async def finish_login(event, state):
         schedule_onboarding([acc.key], notify=event.chat_id)
         lines += ["", f"{E_REFRESH} {S('Joining it to all client channels in the background...')}"]
     await event.respond(card(E_CHECK, "Account Added", lines,
-                             footer=f"{E_SHIELD} {S('Saved into the sessions folder.')}"),
+                             footer=f"{E_SHIELD} {S('Saved in MongoDB; the dyno disk is only a temporary cache.')}"),
                         buttons=buttons)
 
 
@@ -5502,22 +8104,25 @@ async def flow_create_client(event, state, text):
                              f"cuser_{state['client_user_id']}")
         state.update({"channel_link": text.strip(), "channel_type": ltype,
                       "channel_target": target, "step": "accounts_count"})
+        available = await available_account_count()
         return await event.respond(card(E_PERSON, "Create Client", [
             S("Step 3 of 6"),
             "",
-            field(E_GREEN, "Accounts online", str(acc_count())),
+            field(E_GREEN, "Accounts available across workers", str(available)),
+            field(E_REFRESH, "Worker size", f"{ACCOUNT_SHARD_SIZE} {S('per worker')}"),
             "",
-            f"{S('How many accounts should join?')} (1-{joinable_count()})",
+            f"{S('How many accounts should join?')} (1-{available})",
         ]), buttons=[[btn("Cancel", "home", icon="↩️")]])
 
     if step == "accounts_count":
         if not text.isdigit():
             return await bad(event, "Numbers only.")
         n = int(text)
-        # Frozen accounts cannot join, so promising them to a client would
-        # under-deliver the package from day one.
-        if n < 1 or n > joinable_count():
-            return await bad(event, f"Enter between 1 and {joinable_count()}.")
+        # In sharded mode the controller only has its local ten sessions; the
+        # package limit must use the MongoDB fleet total instead.
+        available = await available_account_count()
+        if n < 1 or n > available:
+            return await bad(event, f"Enter between 1 and {available}.")
         state["accounts_count"] = n
         state["step"] = "reactions"
         return await event.respond(card(E_THUMB, "Create Client", [
@@ -5640,8 +8245,9 @@ async def create_client_now(event, state):
                 await log_activity(key, "CLIENT_JOIN", state["channel_link"],
                                    f"flood {e.seconds}s")
             except Exception as e:
-                if is_frozen_account_error(e):
-                    mark_frozen(key)
+                # Creating a subscription is the moment a bad login shows up;
+                # without this the client got a package full of dead sessions.
+                await note_account_error(key, e)
                 await log_activity(key, "CLIENT_JOIN", state["channel_link"],
                                    str(e)[:40])
             if channel_id is None:
@@ -5691,6 +8297,8 @@ async def create_client_now(event, state):
         "joined_accounts": joined,
     })
     await setup_channel_monitors()
+    if sharding_runtime_enabled():
+        await enqueue_internal_worker_fanout("onboard", {"subscription_id": str(sub["_id"])})
 
     warn = []
     if channel_id is None:
@@ -5774,33 +8382,46 @@ async def handle_zip_import(event):
             field(E_PAGE, "Session files", str(len(found))),
             field(E_LOCK, "String sessions", str(len(strings))),
             "",
-            S("Copying into the sessions folder..."),
+            S("Copying into the MongoDB-backed session store..."),
         ]), force=True)
 
-        stats = {"alive": 0, "dead": 0, "unknown": 0, "no_meta": 0,
-                 "desktop": 0, "android": 0}
+        stats = {"alive": 0, "dead": 0, "unknown": 0, "queued": 0,
+                 "no_meta": 0, "desktop": 0, "android": 0}
         new_keys: List[str] = []
 
-        for i, src in enumerate(found, 1):
+        # Reserve unique destination names before starting concurrent probes.
+        reserved = set(os.listdir(SESSIONS_DIR))
+        destinations = []
+        for src in found:
             stem = os.path.splitext(os.path.basename(src))[0]
-            dest = os.path.join(SESSIONS_DIR, stem + ".session")
+            name = stem + ".session"
             n = 1
-            while os.path.exists(dest):
-                dest = os.path.join(SESSIONS_DIR, f"{stem}_{n}.session")
+            while name in reserved:
+                name = f"{stem}_{n}.session"
                 n += 1
+            reserved.add(name)
+            destinations.append(os.path.join(SESSIONS_DIR, name))
+
+        async def import_one(index: int, src: str, dest: str) -> dict:
+            """Copy and probe one session; several independent accounts run in parallel."""
+            stem = os.path.splitext(os.path.basename(dest))[0]
+            result = {"state": "unknown", "key": None, "no_meta": 0,
+                      "desktop": 0, "android": 0}
             try:
                 shutil.copy2(src, dest)
-            except Exception as e:
-                logger.warning(f"copy {src}: {e}")
-                continue
+            except Exception as exc:
+                logger.warning(f"copy {src}: {exc}")
+                return result
 
             # A session's auth key is bound to the api_id that made it, and
             # Telegram checks the device signature against that api_id. Carry
             # the bundle's own json across or the session gets revoked in a day
             # or two — this is the single biggest cause of ZIP accounts dying.
             meta = {}
-            for cand in (os.path.splitext(src)[0] + ".json",
-                         os.path.join(os.path.dirname(src), stem + ".json")):
+            source_stem = os.path.splitext(src)[0]
+            for cand in (source_stem + ".json",
+                         os.path.join(os.path.dirname(src),
+                                      os.path.basename(source_stem) + ".json")):
                 if os.path.exists(cand):
                     try:
                         with open(cand, "r", encoding="utf-8") as fh:
@@ -5813,29 +8434,74 @@ async def handle_zip_import(event):
 
             api_id, api_hash = creds_from_meta(meta)
             if not meta_get(meta, "api_id"):
-                stats["no_meta"] += 1
+                result["no_meta"] = 1
             device = device_profile_for(api_id, meta)
-            if device["device_model"] == DESKTOP_PROFILE["device_model"]:
-                stats["desktop"] += 1
-            else:
-                stats["android"] += 1
+            result["desktop" if device["device_model"] == DESKTOP_PROFILE["device_model"]
+                   else "android"] = 1
             write_meta(dest, api_id=api_id, api_hash=api_hash,
                        user_id=meta_get(meta, "user_id") or 0,
                        first_name=meta_get(meta, "first_name") or "",
                        phone=meta_get(meta, "phone") or "", **device)
 
-            # NB: do not call this `state` — that name is the import flow's own
-            # variable and shadowing it here broke nothing yet only by luck.
-            res_state, _acc = await probe_and_register(dest)
-            stats[res_state] += 1
-            if res_state == "alive" and _acc and _acc.key:
-                new_keys.append(_acc.key)
-            await asyncio.sleep(0.2)
-            await prog.show(progress_card("Importing", i, len(found), [
+            if sharding_runtime_enabled():
+                # Do not open every imported session on worker.1. Persist the
+                # file first, let Mongo assign its shard, and let the owning
+                # worker probe it. This is what prevents a ZIP import from
+                # briefly using all accounts on the controller IP.
+                try:
+                    await persist_session_bundle(dest)
+                    result["state"] = "queued"
+                except Exception as exc:
+                    result["state"] = "unknown"
+                    logger.warning("%s: queued session save failed: %s", stem, exc)
+                return result
+
+            try:
+                # Do not upload twice. probe_and_register persists a live
+                # session; this call covers dead/unclear files too.
+                res_state, acc = await asyncio.wait_for(
+                    probe_and_register(dest), timeout=SESSION_PROBE_TIMEOUT)
+            except asyncio.TimeoutError:
+                res_state, acc = "unknown", None
+                PROBLEM_SESSIONS[stem] = "probe timeout"
+                logger.warning("%s: session probe timed out after %ss",
+                               stem, SESSION_PROBE_TIMEOUT)
+            except Exception as exc:
+                res_state, acc = "unknown", None
+                logger.warning("%s: import probe failed: %s", stem, exc)
+            try:
+                await persist_session_bundle(dest)
+            except Exception as exc:
+                logger.warning("%s: MongoDB session save failed: %s", stem, exc)
+            result["state"] = res_state
+            result["key"] = acc.key if res_state == "alive" and acc else None
+            return result
+
+        # Ten-to-twelve Telegram connections at once is much faster than the
+        # old one-at-a-time loop without opening 118 sockets simultaneously.
+        for offset in range(0, len(found), ZIP_IMPORT_CONCURRENCY):
+            batch = list(enumerate(
+                zip(found[offset:offset + ZIP_IMPORT_CONCURRENCY],
+                    destinations[offset:offset + ZIP_IMPORT_CONCURRENCY]),
+                offset + 1,
+            ))
+            results = await asyncio.gather(
+                *(import_one(index, src, dest) for index, (src, dest) in batch),
+                return_exceptions=False,
+            )
+            for result in results:
+                stats[result["state"]] += 1
+                stats["no_meta"] += result["no_meta"]
+                stats["desktop"] += result["desktop"]
+                stats["android"] += result["android"]
+                if result["key"]:
+                    new_keys.append(result["key"])
+            done = min(offset + len(results), len(found))
+            await prog.show(progress_card("Importing", done, len(found), [
                 field(E_GREEN, "Online", str(stats["alive"])),
                 field(E_RED, "Not authorised", str(stats["dead"])),
                 field(E_WARN, "Unclear", str(stats["unknown"])),
-            ]))
+            ]), force=True)
 
         for s in strings:
             imported = await import_string_session(s)
@@ -5847,6 +8513,12 @@ async def handle_zip_import(event):
                 stats["dead"] += 1
             await asyncio.sleep(0.3)
 
+        if sharding_runtime_enabled():
+            await reconcile_account_shards()
+            await restore_runtime_storage(force=False)
+            await prune_local_sessions_not_owned()
+            await load_all_sessions()
+
         await setup_channel_monitors()
         # Every account that came in from this ZIP now walks into all the
         # active client channels, in the background, so the fleet that just grew
@@ -5857,8 +8529,12 @@ async def handle_zip_import(event):
             field(E_GREEN, "Now online", str(stats["alive"])),
             field(E_RED, "Not authorised", str(stats["dead"])),
             field(E_WARN, "Unclear", str(stats["unknown"])),
+            (field(E_PAGE, "Queued for account workers", str(stats["queued"]))
+             if stats.get("queued") else None),
             "",
-            field(E_PERSON, "Total accounts online", str(acc_count())),
+            field(E_PERSON, "Accounts on this worker", str(acc_count())),
+            (field(E_CHART, "Total queued sessions", str(stats["queued"]))
+             if stats.get("queued") else None),
             "",
             field(E_DIAMOND, "Desktop profile", str(stats["desktop"])),
             field(E_PHONE, "Android profile", str(stats["android"])),
@@ -5893,23 +8569,51 @@ async def main():
     print("=" * 58)
     print("  REACTION & VIEWS BOT")
     print("=" * 58)
-    print(f"  sessions dir : {SESSIONS_DIR}")
+    print(f"  runtime dir  : {RUNTIME_ROOT}")
     print(f"  owners       : {OWNER_IDS}")
 
+    if CONFIG_MISSING:
+        print("  configuration: missing " + ", ".join(CONFIG_MISSING))
+        print("  Set Heroku Config Vars; secrets are intentionally not in view.py.")
+        return
+    if sharding_runtime_enabled() and WORKER_SLOT > 0:
+        # Stagger 24 dyno boots so a free Mongo cluster is not hit by every
+        # GridFS restore/Telethon connection in the same second.
+        await asyncio.sleep(min(30, WORKER_SLOT * 2))
     try:
+        initialize_mongo_client()
         await mongo_client.admin.command("ping")
-        print("  mongodb      : connected (clients only)")
-    except Exception as e:
-        print(f"  mongodb      : FAILED - {e}")
+        await ensure_database_indexes()
+        # First import an existing VPS copy only when MongoDB does not already
+        # have that object, then restore the canonical MongoDB copy. This makes
+        # the same code safe for both the one-time migration and every restart.
+        await migrate_legacy_storage_if_needed()
+        if sharding_runtime_enabled():
+            await reconcile_account_shards()
+        await restore_runtime_storage()
+        print("  mongodb      : connected (clients + GridFS runtime storage)")
+        if sharding_runtime_enabled():
+            print(f"  worker shard  : slot {WORKER_SLOT}, max {ACCOUNT_SHARD_SIZE} accounts")
+    except Exception as exc:
+        print(f"  mongodb      : FAILED - {exc}")
         return
 
     await load_settings()
-    await bot.start(bot_token=BOT_TOKEN)
-    me = await bot.get_me()
-    print(f"  bot          : @{me.username}")
+    if IS_CONTROLLER_WORKER:
+        try:
+            await bot.start(bot_token=BOT_TOKEN)
+            me = await bot.get_me()
+        except Exception as exc:
+            print(f"  telegram bot  : FAILED - {exc}")
+            return
+        print(f"  bot          : @{me.username}")
+    else:
+        print(f"  account worker: slot {WORKER_SLOT} ({WORKER_INSTANCE_ID})")
     print("=" * 58)
 
     tally = await load_all_sessions()
+    # Persist metadata written during the probe before any worker starts.
+    await sync_runtime_storage()
     print(f"  accounts     : {acc_count()} online "
           f"(dead {tally['dead']}, unclear {tally['unknown']})")
     if PROBLEM_SESSIONS:
@@ -5917,17 +8621,22 @@ async def main():
               f"(nothing deleted — see Accounts > Needs Review)")
 
     await setup_channel_monitors()
+    asyncio.create_task(runtime_storage_task())
     asyncio.create_task(monitor_task())
     asyncio.create_task(livestream_watch_task())
     asyncio.create_task(live_keepalive_task())
-    asyncio.create_task(reminder_task())
-    asyncio.create_task(expiry_check_task())
+    if IS_CONTROLLER_WORKER:
+        asyncio.create_task(reminder_task())
+        asyncio.create_task(expiry_check_task())
     asyncio.create_task(keep_alive_task())
     asyncio.create_task(onboard_sweep_task())
+    asyncio.create_task(dashboard_task_worker())
+    if sharding_runtime_enabled():
+        asyncio.create_task(worker_shard_reconcile_task())
 
     if not TGCALLS_OK:
         print(f"  live audio   : UNAVAILABLE — {TGCALLS_ERR}")
-        print("                 pip install py-tgcalls && apt install -y ffmpeg")
+        print("                 install py-tgcalls and the ffmpeg Apt buildpack")
     elif not os.path.exists(LIVE_AUDIO_PATH):
         print("  live audio   : no file set (Home > Audio > Set Audio)")
     else:
@@ -5941,9 +8650,40 @@ async def main():
                if LIVE_ROTATE else "off")
         print(f"  rotation     : {rot}")
 
-    print("  status       : ready")
+    print("  status       : ready; MongoDB is the persistence layer")
     print("=" * 58)
-    await bot.run_until_disconnected()
+
+    # Heroku sends SIGTERM before replacing a dyno. Ask Telethon to disconnect
+    # cleanly so the final GridFS sync below gets a chance to run.
+    loop = asyncio.get_running_loop()
+    shutdown_event = asyncio.Event()
+
+    def request_shutdown():
+        shutdown_event.set()
+        if IS_CONTROLLER_WORKER:
+            asyncio.create_task(bot.disconnect())
+
+    for shutdown_signal in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(shutdown_signal, request_shutdown)
+        except (NotImplementedError, RuntimeError):
+            pass
+    try:
+        if IS_CONTROLLER_WORKER:
+            await bot.run_until_disconnected()
+        else:
+            await shutdown_event.wait()
+    finally:
+        try:
+            await release_worker_shards()
+        except Exception as exc:
+            logger.error("worker lease release failed: %s", exc)
+        try:
+            await sync_runtime_storage()
+        except Exception as exc:
+            logger.error("final runtime storage sync failed: %s", exc)
+        if mongo_client is not None:
+            mongo_client.close()
 
 
 if __name__ == "__main__":

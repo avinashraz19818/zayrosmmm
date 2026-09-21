@@ -3,6 +3,13 @@ __pycache__/
 *.pyc
 *.session
 *.session-journal
+*.session-wal
+*.session-shm
 .bot.pid
 bot.log
+.env
+.env.*
+!.env.example
 sessions/
+sessions_trash/
+.runtime/

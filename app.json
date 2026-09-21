@@ -1,0 +1,86 @@
+{
+  "name": "zayros-smm-bot",
+  "description": "Telegram account manager with MongoDB/GridFS persistence",
+  "repository": "https://github.com/avinashraz19818/zayrosmmm",
+  "keywords": ["telegram", "telethon", "mongodb", "gridfs", "heroku"],
+  "buildpacks": [
+    {
+      "url": "https://github.com/jonathanong/heroku-buildpack-ffmpeg-latest.git"
+    },
+    {
+      "url": "heroku/python"
+    }
+  ],
+  "formation": {
+    "web": {
+      "quantity": 1,
+      "size": "standard-1X"
+    },
+    "worker": {
+      "quantity": 1,
+      "size": "standard-1X"
+    }
+  },
+  "env": {
+    "API_ID": {
+      "description": "Telegram API ID from my.telegram.org",
+      "required": true
+    },
+    "API_HASH": {
+      "description": "Telegram API hash from my.telegram.org",
+      "required": true
+    },
+    "BOT_TOKEN": {
+      "description": "BotFather token",
+      "required": true
+    },
+    "MONGO_URI": {
+      "description": "Existing MongoDB Atlas connection string",
+      "required": true
+    },
+    "OWNER_IDS": {
+      "description": "Comma-separated Telegram owner user IDs",
+      "required": true
+    },
+    "MONGO_DB_NAME": {
+      "description": "Existing MongoDB database name",
+      "value": "tg_manager_bot"
+    },
+    "MONGO_GRIDFS_BUCKET": {
+      "description": "GridFS bucket for sessions, bot session and audio",
+      "value": "tg_manager_storage"
+    },
+    "STORAGE_SYNC_INTERVAL": {
+      "description": "Runtime session sync interval in seconds",
+      "value": "120"
+    },
+    "ACCOUNT_SHARDING": {
+      "description": "Use one account worker shard per up to ACCOUNT_SHARD_SIZE sessions",
+      "value": "true"
+    },
+    "ACCOUNT_SHARD_SIZE": {
+      "description": "Maximum Telegram account sessions owned by one worker",
+      "value": "10"
+    },
+    "HEROKU_APP_NAME": {
+      "description": "This Heroku app name, required for automatic worker scaling",
+      "required": false
+    },
+    "HEROKU_API_KEY": {
+      "description": "Heroku Platform API key used only by worker.1 to scale workers",
+      "required": false
+    },
+    "WORKER_RECONCILE_INTERVAL": {
+      "description": "Seconds between account shard/lease reconciliation",
+      "value": "60"
+    },
+    "DASHBOARD_URL": {
+      "description": "Public HTTPS URL of the Heroku web dashboard",
+      "required": false
+    },
+    "DASHBOARD_SESSION_SECRET": {
+      "description": "Random secret used to sign dashboard browser sessions",
+      "required": false
+    }
+  }
+}

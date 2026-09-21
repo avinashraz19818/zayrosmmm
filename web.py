@@ -1032,6 +1032,7 @@ async function plans() {
             <th>Client Name</th>
             <th>Channel Link</th>
             <th>Accs</th>
+            <th>Joined</th>
             <th>Reacts</th>
             <th>Views</th>
             <th>Live</th>
@@ -1046,6 +1047,7 @@ async function plans() {
               <td><strong>${esc(x.name)}</strong></td>
               <td>${esc(x.channel)}</td>
               <td>${x.accounts}</td>
+              <td style="${x.joined < x.accounts ? 'color:#ff8080;font-weight:600' : ''}" title="accounts actually inside the channel — the post package can never exceed this">${x.joined}</td>
               <td>${x.reactions}</td>
               <td>${x.views}</td>
               <td>${x.live}</td>
@@ -1061,7 +1063,7 @@ async function plans() {
                 </div>
               </td>
             </tr>
-          `).join('') : '<tr><td colspan="9" style="text-align:center;color:var(--muted)">No active subscriptions found</td></tr>'}
+          `).join('') : '<tr><td colspan="10" style="text-align:center;color:var(--muted)">No active subscriptions found</td></tr>'}
         </tbody>
       </table>
     </div>
@@ -1557,6 +1559,9 @@ def api_plans():
             "name": d.get("client_name", "Unknown"),
             "channel": d.get("channel_link", ""),
             "accounts": d.get("accounts_count", 0),
+            # Real in-channel coverage of the package: if joined < accounts the
+            # post package is capped by the joined count, so show both numbers.
+            "joined": len(d.get("joined_accounts") or []),
             "reactions": d.get("reactions_per_post", 0),
             "views": d.get("views_per_post", 0),
             "live": d.get("livestream_accounts", 0),

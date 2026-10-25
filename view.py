@@ -16,7 +16,6 @@ import io
 import logging
 import re
 import secrets
-import sys
 import datetime
 import random
 import os
@@ -55,17 +54,14 @@ from telethon.tl.functions.account import (
     UpdateStatusRequest,
     UpdateProfileRequest,
     GetPasswordRequest,
-    UpdatePasswordSettingsRequest,
 )
 from telethon.tl.functions.photos import (
     UploadProfilePhotoRequest,
-    DeletePhotosRequest,
 )
 from telethon.tl.types import (
     PeerChannel, ReactionEmoji,
     ChatReactionsSome,
     UpdateGroupCall, GroupCall,
-    InputCheckPasswordSRP, PasswordKdfAlgoSHA256SHA256PBKDF2HMACSHA512iter100000SHA256ModPow,
 )
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorGridFSBucket
 from bson.objectid import ObjectId
@@ -194,9 +190,6 @@ IS_CONTROLLER_WORKER = WORKER_SLOT == 0
 SHARD_LEASE_SECONDS = 120
 
 # Every live audio stream costs an ffmpeg process, a WebRTC connection and a
-# second MTProto socket. The usual 1024-descriptor default runs out partway
-# through a large fleet, and the first casualty is Telethon's session sqlite —
-# so accounts start dropping for a reason that looks nothing like the cause., a WebRTC connection and a
 # second MTProto socket. The usual 1024-descriptor default runs out partway
 # through a large fleet, and the first casualty is Telethon's session sqlite —
 # so accounts start dropping for a reason that looks nothing like the cause.
@@ -1778,10 +1771,8 @@ async def _dashboard_session_import_local(params: dict) -> dict:
             await reconcile_account_shards()
             await restore_runtime_storage(force=False)
             await prune_local_sessions_not_owned()
-            # Worker.1 is the controller and may own the first shard. Load its
-            # newly assigned files immediately instead of waiting for the next
-            # 60-second reconcile tick.
-            await load_all_sessions()
+        # Immediately load newly assigned or imported sessions
+        await load_all_sessions()
         return {"ok": ok, "failed": failed, "queued": ok,
                 "error": "" if not failed else "some files failed"}
     except zipfile.BadZipFile:
@@ -4214,9 +4205,13 @@ async def process_new_post(channel_id: int, message_id: int):
             # Preserve one reaction job per selected local account while the
             # emoji distribution still represents the whole package.
             index_by_key = {key: index for index, key in enumerate(global_react)}
-            emoji_plan = [global_plan[index_by_key[key]]
-                          for key in react_keys
-                          if index_by_key.get(key, n_react) < len(global_plan)]
+            emoji_plan = []
+            for key in react_keys:
+                idx = index_by_key.get(key)
+                if idx is not None and idx < len(global_plan):
+                    emoji_plan.append(global_plan[idx])
+                else:
+                    emoji_plan.append(random.choice(REACTION_EMOJIS))
 
         done = {"react": 0, "view": 0}
         spare_lock = asyncio.Lock()
@@ -4251,8 +4246,9 @@ async def process_new_post(channel_id: int, message_id: int):
                         peer = await resolve_peer(key, client, spec)
                         if peer is not None:
                             if kind == "react":
+                                react_emoji = emoji or random.choice(REACTION_EMOJIS)
                                 ok, err = await send_reaction(client, peer,
-                                                              message_id, emoji,
+                                                              message_id, react_emoji,
                                                               key)
                             else:
                                 ok, err = await send_views(client, peer,
@@ -5933,8 +5929,8 @@ async def show_help(event):
         f"  {S('Sessions restore from MongoDB. Import a ZIP of .session files or log in by phone; the local copy syncs automatically.')}",
         "",
         f"{E_PAGE} <b>{S('Link formats')}</b>",
-        f"  <code>https://t.me/channel/123</code>",
-        f"  <code>https://t.me/c/1234567890/123</code>",
+        "  <code>https://t.me/channel/123</code>",
+        "  <code>https://t.me/c/1234567890/123</code>",
     ], footer=f"{E_SHIELD} {S('Commands')}: /start /add /remove /list /reload /id")
     await safe_edit(event, text, [[btn("Home", "home", icon="🏠")]])
 
@@ -7196,10 +7192,10 @@ def upgrade_summary(state) -> str:
     n_views = int(new.get("views", doc.get("views_per_post", 0)) or 0)
     n_live = int(new.get("livestream", doc.get("livestream_accounts", 0)) or 0)
     warn = []
-    need = max(n_react, n_views)
+    need = max(n_react, n_views, n_live)
     if need > n_acc:
         warn.append(f"{E_WARN} {S('Accounts raised to')} <b>{need}</b> "
-                    f"{S('so reactions and views fit.')}")
+                    f"{S('so reactions, views and livestream fit.')}")
     if need > fleet_account_count():
         warn.append(f"{E_WARN} {S('Only')} <b>{fleet_account_count()}</b> "
                     f"{S('accounts are available across workers — the rest cannot join yet.')}")
@@ -7220,9 +7216,9 @@ async def apply_upgrade(event, state):
     n_views = int(new.get("views", doc.get("views_per_post", 0)) or 0)
     n_live = int(new.get("livestream", doc.get("livestream_accounts", 0)) or 0)
     add_days = int(new.get("days", 0) or 0)
-    # Reactions/views can never exceed the account count, so raise it to fit
+    # Reactions/views/livestream can never exceed account count, so raise it to fit
     # instead of silently capping the package the customer paid for.
-    n_acc = max(n_acc, n_react, n_views)
+    n_acc = max(n_acc, n_react, n_views, n_live)
 
     if n_react == 0 and n_views == 0:
         return await respond_or_edit(event, card(E_CROSS, "Invalid Package", [
@@ -7797,7 +7793,6 @@ async def execute_go_live(event, state, count):
         ]), buttons=[[btn("Live Now", "live_now", icon="🎤")],
                      [btn("Home", "home", icon="🏠")]])
     ltype, target = state["ltype"], state["target"]
-    spec = target if ltype == "public" else None
     chat_id = None
     usable: List[str] = []
 
@@ -8518,6 +8513,7 @@ async def handle_zip_import(event):
             await restore_runtime_storage(force=False)
             await prune_local_sessions_not_owned()
             await load_all_sessions()
+            new_keys = list(acc_keys())
 
         await setup_channel_monitors()
         # Every account that came in from this ZIP now walks into all the

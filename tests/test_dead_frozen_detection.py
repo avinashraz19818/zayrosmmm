@@ -198,6 +198,30 @@ async def check_health_probe_and_scan():
     assert blip.key not in dead and blip.key not in frozen
 
 
+def test_classifiers():
+    check_classifiers()
+
+
+def test_dead_problem_classification():
+    check_dead_problem_classification()
+
+
+def test_dead_account_leaves_the_pool():
+    asyncio.run(check_dead_account_leaves_the_pool())
+
+
+def test_frozen_is_parked_not_deleted():
+    asyncio.run(check_frozen_is_parked_not_deleted())
+
+
+def test_error_reporting():
+    asyncio.run(check_error_reporting())
+
+
+def test_health_probe_and_scan():
+    asyncio.run(check_health_probe_and_scan())
+
+
 async def main():
     check_classifiers()
     check_dead_problem_classification()

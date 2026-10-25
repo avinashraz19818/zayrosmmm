@@ -13,12 +13,10 @@
   ],
   "formation": {
     "web": {
-      "quantity": 1,
-      "size": "standard-1X"
+      "quantity": 1
     },
     "worker": {
-      "quantity": 1,
-      "size": "standard-1X"
+      "quantity": 1
     }
   },
   "env": {
@@ -35,7 +33,7 @@
       "required": true
     },
     "MONGO_URI": {
-      "description": "Existing MongoDB Atlas connection string",
+      "description": "Existing MongoDB Atlas connection string (e.g. mongodb+srv://...)",
       "required": true
     },
     "OWNER_IDS": {
@@ -63,7 +61,7 @@
       "value": "10"
     },
     "HEROKU_APP_NAME": {
-      "description": "This Heroku app name, required for automatic worker scaling",
+      "description": "This Heroku app name, required for automatic worker scaling and dashboard links",
       "required": false
     },
     "HEROKU_API_KEY": {
@@ -75,12 +73,12 @@
       "value": "60"
     },
     "DASHBOARD_URL": {
-      "description": "Public HTTPS URL of the Heroku web dashboard",
+      "description": "Public HTTPS URL of the Heroku web dashboard (optional, derived from HEROKU_APP_NAME)",
       "required": false
     },
     "DASHBOARD_SESSION_SECRET": {
       "description": "Random secret used to sign dashboard browser sessions",
-      "required": false
+      "generator": "secret"
     }
   }
 }

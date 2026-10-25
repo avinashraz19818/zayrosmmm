@@ -12,10 +12,9 @@ import os
 import re
 import time
 from datetime import datetime, timezone
-from html import escape
 
 from bson import ObjectId
-from flask import Flask, jsonify, redirect, render_template_string, request, session, url_for
+from flask import Flask, jsonify, redirect, render_template_string, request, session
 from gridfs import GridFS
 from pymongo import MongoClient, ReturnDocument
 

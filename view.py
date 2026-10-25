@@ -1341,6 +1341,8 @@ async def reconcile_account_shards() -> set:
             {"_id": 1},
         ).sort("_id", 1).to_list(length=None)
         names = [doc["_id"] for doc in session_docs]
+        if col_account_shards is not None:
+            await col_account_shards.delete_many({"_id": {"$nin": names}})
         desired_workers = max(1, ceil(len(names) / ACCOUNT_SHARD_SIZE))
         await heroku_scale_workers(desired_workers)
 
@@ -1910,6 +1912,18 @@ async def run_dashboard_child_task(task: dict) -> dict:
         return await _dashboard_views_local(params)
     if action == "set_name":
         return await _dashboard_set_name_local(params)
+    if action == "clean_dead":
+        dead = list(dead_keys())
+        stems = list(dead_problem_stems())
+        c = 0
+        for k in dead:
+            if await purge_dead_account(k): c += 1
+        for s in stems:
+            if await purge_dead_account(s, s): c += 1
+        if sharding_runtime_enabled():
+            await reconcile_account_shards()
+        await setup_channel_monitors()
+        return {"ok": c, "failed": 0, "cleaned": c}
     if action == "random_names":
         return await _dashboard_random_names_local(params)
     if action == "profile_photo":
@@ -2205,6 +2219,92 @@ async def note_account_error(key: str, err: Exception) -> bool:
     return False
 
 
+
+async def purge_dead_account(key: str, stem: Optional[str] = None) -> bool:
+    """Completely purge a dead account from memory, disk, GridFS, shards, and client subscriptions."""
+    acc = ACCOUNTS.get(key)
+    stem = stem or (acc.stem if acc else str(key).lstrip("+"))
+    path = acc.path if acc else os.path.join(SESSIONS_DIR, f"{stem}.session")
+
+    if acc:
+        acc.state = "dead"
+        await disconnect_account(key)
+        ACCOUNTS.pop(key, None)
+
+    PROBLEM_SESSIONS.pop(stem, None)
+    FROZEN_ACCOUNTS.pop(key, None)
+
+    # 1. Move session bundle to trash (local and GridFS)
+    if os.path.exists(path):
+        try:
+            await to_trash(path)
+        except Exception as exc:
+            logger.warning("purge to_trash failed for %s: %s", stem, exc)
+    else:
+        remote_session = f"sessions/{stem}.session"
+        try:
+            await storage_delete(remote_session)
+            await storage_delete(f"sessions/{stem}.json")
+        except Exception:
+            pass
+
+    # 2. Delete from col_account_shards so no worker ever claims it
+    if col_account_shards is not None:
+        try:
+            await col_account_shards.delete_many({
+                "$or": [
+                    {"_id": f"sessions/{stem}.session"},
+                    {"account_key": key},
+                    {"account_key": stem}
+                ]
+            })
+        except Exception as exc:
+            logger.warning("purge account_shards failed for %s: %s", stem, exc)
+
+    # 3. Pull from all client subscriptions' joined_accounts
+    if col_clients is not None:
+        try:
+            await col_clients.update_many(
+                {"joined_accounts": {"$in": [key, stem]}},
+                {"$pull": {"joined_accounts": {"$in": [key, stem]}}, "$set": {"updated_at": utcnow()}}
+            )
+        except Exception as exc:
+            logger.warning("purge client joined_accounts failed for %s: %s", key, exc)
+
+    invalidate_peer_cache()
+    return True
+
+
+async def auto_dead_cleanup_task():
+    """Periodically scan and auto-purge dead accounts so workers do not carry useless load."""
+    sweep_counter = 0
+    while True:
+        await asyncio.sleep(60)
+        try:
+            sweep_counter += 1
+            if sweep_counter >= 30:
+                sweep_counter = 0
+                try:
+                    await scan_dead_accounts()
+                except Exception as exc:
+                    logger.debug("periodic scan_dead_accounts: %s", exc)
+
+            dead = list(dead_keys())
+            stems = list(dead_problem_stems())
+            if dead or stems:
+                logger.info("auto-purging %s registered dead account(s) and %s dead file(s)",
+                            len(dead), len(stems))
+                for k in dead:
+                    await purge_dead_account(k)
+                for s in stems:
+                    await purge_dead_account(s, s)
+                if sharding_runtime_enabled():
+                    await reconcile_account_shards()
+                await setup_channel_monitors()
+        except Exception as exc:
+            logger.error("auto_dead_cleanup_task error: %s", exc)
+
+
 def is_dead_problem(reason: str) -> bool:
     """Is this Needs Review entry a login Telegram says is gone?
 
@@ -2313,6 +2413,22 @@ async def to_trash(session_path: str) -> int:
             moved += 1
         except Exception as exc:
             logger.warning("trash %s: %s", src, exc)
+    remote_session = f"sessions/{stem}.session"
+    if col_account_shards is not None:
+        try:
+            await col_account_shards.delete_many({
+                "$or": [{"_id": remote_session}, {"account_key": stem}]
+            })
+        except Exception:
+            pass
+    if col_clients is not None:
+        try:
+            await col_clients.update_many(
+                {"joined_accounts": stem},
+                {"$pull": {"joined_accounts": stem}, "$set": {"updated_at": utcnow()}}
+            )
+        except Exception:
+            pass
     return moved
 
 
@@ -6448,21 +6564,16 @@ async def route_callback(event, uid, owner, data):
 
     if data == "acc_rm_dead_do":
         removed = 0
-        for key in dead_keys():
+        for key in list(dead_keys()):
             acc = ACCOUNTS.get(key)
-            if not acc:
-                continue
-            await disconnect_account(key)
-            if await to_trash(acc.path):
+            stem = acc.stem if acc else None
+            if await purge_dead_account(key, stem):
                 removed += 1
-            ACCOUNTS.pop(key, None)
-            PROBLEM_SESSIONS.pop(acc.stem, None)
-        for stem in dead_problem_stems():
-            path = os.path.join(SESSIONS_DIR, stem + ".session")
-            if os.path.exists(path) and await to_trash(path):
+        for stem in list(dead_problem_stems()):
+            if await purge_dead_account(stem, stem):
                 removed += 1
-            PROBLEM_SESSIONS.pop(stem, None)
-        invalidate_peer_cache()
+        if sharding_runtime_enabled():
+            await reconcile_account_shards()
         await setup_channel_monitors()
         await event.answer(f"Trashed {removed} dead file(s)")
         return await show_accounts_menu(event)
@@ -8608,6 +8719,17 @@ async def main():
     print("=" * 58)
 
     tally = await load_all_sessions()
+    # Auto-purge any accounts detected as dead on startup so workers don't carry dead weight
+    dead_boot = list(dead_keys())
+    stems_boot = list(dead_problem_stems())
+    if dead_boot or stems_boot:
+        print(f"  purging dead : {len(dead_boot)} account(s) moved to trash on boot")
+        for k in dead_boot:
+            await purge_dead_account(k)
+        for s in stems_boot:
+            await purge_dead_account(s, s)
+        if sharding_runtime_enabled():
+            await reconcile_account_shards()
     # Persist metadata written during the probe before any worker starts.
     await sync_runtime_storage()
     print(f"  accounts     : {acc_count()} online "
@@ -8624,6 +8746,7 @@ async def main():
     if IS_CONTROLLER_WORKER:
         asyncio.create_task(reminder_task())
         asyncio.create_task(expiry_check_task())
+        asyncio.create_task(auto_dead_cleanup_task())
     asyncio.create_task(keep_alive_task())
     asyncio.create_task(onboard_sweep_task())
     asyncio.create_task(dashboard_task_worker())

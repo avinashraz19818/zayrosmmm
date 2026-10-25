@@ -220,6 +220,21 @@ def test_error_reporting():
 
 def test_health_probe_and_scan():
     asyncio.run(check_health_probe_and_scan())
+async def check_purge_dead_account():
+    reset()
+    view._notify_owners_soon = lambda text: None
+    acc = account("+910000000005")
+    view.ACCOUNTS[acc.key] = acc
+    view.PROBLEM_SESSIONS[acc.stem] = "dead — not authorised"
+    await view.purge_dead_account(acc.key)
+    assert acc.key not in view.ACCOUNTS
+    assert acc.stem not in view.PROBLEM_SESSIONS
+    assert acc.key not in view.dead_keys()
+
+
+def test_purge_dead_account():
+    asyncio.run(check_purge_dead_account())
+
 
 
 async def main():
@@ -229,6 +244,7 @@ async def main():
     await check_frozen_is_parked_not_deleted()
     await check_error_reporting()
     await check_health_probe_and_scan()
+    await check_purge_dead_account()
     print("all dead/frozen detection checks passed")
 
 

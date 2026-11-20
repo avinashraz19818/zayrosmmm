@@ -607,8 +607,8 @@ def error_codes(err: BaseException) -> str:
 # only when the owner asks for it.
 DEAD_ACCOUNT_MARKERS = (
     "USER_DEACTIVATED", "AUTH_KEY_UNREGISTERED", "SESSION_REVOKED",
-    "AUTH_KEY_DUPLICATED", "AUTH_KEY_INVALID", "SESSION_EXPIRED",
-    "PHONE_NUMBER_BANNED",
+    "AUTH_KEY_DUPLICATED", "AUTH_KEY_INVALID", "AUTH_KEY_PERM_EMPTY",
+    "SESSION_EXPIRED", "PHONE_NUMBER_BANNED", "PHONE_NUMBER_UNOCCUPIED",
 )
 
 
@@ -617,8 +617,9 @@ DEAD_ACCOUNT_MARKERS = (
 # join/reaction slot, and they must never be treated as dead.
 FROZEN_ACCOUNT_MARKERS = (
     "FROZEN_METHOD_INVALID", "FROZEN_PARTICIPANT_MISSING",
-    "FROZENMETHODINVALID", "NOT AVAILABLE FOR FROZEN ACCOUNTS",
-    "ACCOUNT IS FROZEN",
+    "FROZEN_BOT_INVALID", "FROZENMETHODINVALID",
+    "NOT AVAILABLE FOR FROZEN ACCOUNTS", "ACCOUNT IS FROZEN",
+    "USER_RESTRICTED",
 )
 
 
@@ -1470,6 +1471,8 @@ async def worker_shard_reconcile_task():
                     if account.stem not in allowed_stems:
                         await disconnect_account(key)
                         ACCOUNTS.pop(key, None)
+                        PROBLEM_SESSIONS.pop(account.stem, None)
+                        FROZEN_ACCOUNTS.pop(key, None)
                 await prune_local_sessions_not_owned()
                 # Probe only newly claimed local files, not all ten on every tick.
                 loaded_stems = {a.stem for a in ACCOUNTS.values()}
@@ -1521,7 +1524,11 @@ async def _dashboard_join_local(params: dict) -> dict:
 
     async def one(key):
         async with sem:
+            if not account_usable(key):
+                return
             client = acc_client(key)
+            if client is None:
+                return
             try:
                 if ltype == "public":
                     await client(JoinChannelRequest(target))
@@ -1535,6 +1542,7 @@ async def _dashboard_join_local(params: dict) -> dict:
                 successful.append(key)
             except Exception as exc:
                 result["failed"] += 1
+                await note_account_error(key, exc)
                 await log_activity(key, "DASHBOARD_JOIN", link, str(exc)[:80])
 
     await asyncio.gather(*(one(key) for key in keys))
@@ -1559,6 +1567,8 @@ async def _dashboard_leave_local(params: dict) -> dict:
     result = {"ok": 0, "failed": 0}
     for key in worker_task_keys(int(params.get("limit", 0) or 0)):
         client = acc_client(key)
+        if client is None:
+            continue
         try:
             if ltype == "public":
 
@@ -1567,7 +1577,8 @@ async def _dashboard_leave_local(params: dict) -> dict:
                 entity = await client.get_entity(link)
                 await client.delete_dialog(entity)
             result["ok"] += 1
-        except Exception:
+        except Exception as exc:
+            await note_account_error(key, exc)
             result["failed"] += 1
         await asyncio.sleep(0.05)
     invalidate_peer_cache()
@@ -1609,15 +1620,18 @@ async def _dashboard_react_local(params: dict) -> dict:
     result = {"ok": 0, "failed": 0}
     for key in worker_task_keys(int(params.get("limit", 0) or 0)):
         client = acc_client(key)
+        if client is None:
+            continue
         try:
             peer = await resolve_peer(key, client, spec)
             if peer is None:
                 result["failed"] += 1
                 continue
             for emoji in emojis:
-                ok, _err = await send_reaction(client, peer, message_id, emoji)
+                ok, _err = await send_reaction(client, peer, message_id, emoji, key)
                 result["ok" if ok else "failed"] += 1
-        except Exception:
+        except Exception as exc:
+            await note_account_error(key, exc)
             result["failed"] += 1
         await asyncio.sleep(0.05)
     await increment_stats(reactions=result["ok"])
@@ -1632,14 +1646,17 @@ async def _dashboard_views_local(params: dict) -> dict:
     result = {"ok": 0, "failed": 0}
     for key in worker_task_keys(int(params.get("limit", 0) or 0)):
         client = acc_client(key)
+        if client is None:
+            continue
         try:
             peer = await resolve_peer(key, client, spec)
             if peer is None:
                 result["failed"] += 1
                 continue
-            ok, _err = await send_views(client, peer, [message_id])
+            ok, _err = await send_views(client, peer, [message_id], key)
             result["ok" if ok else "failed"] += 1
-        except Exception:
+        except Exception as exc:
+            await note_account_error(key, exc)
             result["failed"] += 1
         await asyncio.sleep(0.05)
     await increment_stats(views=result["ok"])
@@ -1653,12 +1670,16 @@ async def _dashboard_set_name_local(params: dict) -> dict:
     parts = name.split(None, 1)
     result = {"ok": 0, "failed": 0}
     for key in worker_task_keys(int(params.get("limit", 0) or 0)):
+        client = acc_client(key)
+        if client is None:
+            continue
         try:
-            await acc_client(key)(UpdateProfileRequest(
+            await client(UpdateProfileRequest(
                 first_name=parts[0], last_name=parts[1] if len(parts) > 1 else ""))
             ACCOUNTS[key].name = parts[0]
             result["ok"] += 1
-        except Exception:
+        except Exception as exc:
+            await note_account_error(key, exc)
             result["failed"] += 1
     return result
 
@@ -1671,14 +1692,18 @@ async def _dashboard_random_names_local(params: dict) -> dict:
         return {"ok": 0, "failed": len(acc_keys()), "error": "names are empty"}
     result = {"ok": 0, "failed": 0}
     for key in worker_task_keys(int(params.get("limit", 0) or 0)):
+        client = acc_client(key)
+        if client is None:
+            continue
         try:
             name = random.choice(names)
             parts = name.split(None, 1)
-            await acc_client(key)(UpdateProfileRequest(
+            await client(UpdateProfileRequest(
                 first_name=parts[0], last_name=parts[1] if len(parts) > 1 else ""))
             ACCOUNTS[key].name = parts[0]
             result["ok"] += 1
-        except Exception:
+        except Exception as exc:
+            await note_account_error(key, exc)
             result["failed"] += 1
     return result
 
@@ -1693,11 +1718,15 @@ async def _dashboard_profile_photo_local(params: dict) -> dict:
     result = {"ok": 0, "failed": 0}
     try:
         for key in worker_task_keys(int(params.get("limit", 0) or 0)):
+            client = acc_client(key)
+            if client is None:
+                continue
             try:
-                uploaded = await acc_client(key).upload_file(path)
-                await acc_client(key)(UploadProfilePhotoRequest(file=uploaded))
+                uploaded = await client.upload_file(path)
+                await client(UploadProfilePhotoRequest(file=uploaded))
                 result["ok"] += 1
-            except Exception:
+            except Exception as exc:
+                await note_account_error(key, exc)
                 result["failed"] += 1
     finally:
         try:
@@ -1865,9 +1894,10 @@ async def _dashboard_live_local(params: dict):
             return {"ok": 0, "failed": 1, "error": "invalid channel link"}
         # Join/resolve with one local account, then let the subscription-aware
         # live starter choose the configured live package for this shard.
-        probe = acc_keys()[0] if acc_keys() else None
+        usable = usable_keys()
+        probe = usable[0] if usable else None
         if not probe:
-            return {"ok": 0, "failed": 1, "error": "no local accounts"}
+            return {"ok": 0, "failed": 1, "error": "no usable local accounts"}
         client = acc_client(probe)
         try:
             if ltype == "public":
@@ -1890,7 +1920,7 @@ async def _dashboard_live_local(params: dict):
 
 
 async def _dashboard_onboard_local(params: dict) -> dict:
-    stats = await onboard_new_accounts(list(acc_keys()))
+    stats = await onboard_new_accounts(list(usable_keys()))
     return {"ok": stats.get("joins", 0) + stats.get("already", 0),
             "failed": stats.get("failed", 0), "channels": stats.get("channels", 0)}
 
@@ -2091,14 +2121,14 @@ def fleet_account_count() -> int:
 
 
 def worker_task_keys(limit: int = 0) -> List[str]:
-    """Global deterministic account selection filtered to this worker shard."""
+    """Global deterministic account selection filtered to this worker shard (usable only)."""
     if sharding_runtime_enabled() and ACCOUNT_SLOT_BY_KEY:
         ordered = sorted(ACCOUNT_SLOT_BY_KEY, key=lambda key: (
             ACCOUNT_SLOT_BY_KEY.get(key, 10**9), str(key)))
         if limit > 0:
             ordered = ordered[:limit]
-        return [key for key in ordered if local_worker_account(key)]
-    keys = list(acc_keys())
+        return [key for key in ordered if local_worker_account(key) and account_usable(key)]
+    keys = list(usable_keys())
     return keys[:limit] if limit > 0 else keys
 
 
@@ -2126,6 +2156,15 @@ def mark_frozen(key: str, reason: str = ""):
                    f"— skipped for {FROZEN_RETRY_AFTER // 3600}h, file kept")
     if acc is not None:
         write_meta(acc.path, frozen_at=time.time())
+        try:
+            loop = asyncio.get_running_loop()
+            sidecar = meta_path(acc.path)
+            if os.path.exists(sidecar):
+                loop.create_task(storage_put_path(
+                    _session_remote_name(sidecar), sidecar, "session_meta"
+                ))
+        except RuntimeError:
+            pass
     _notify_owners_soon(card(E_LOCK, "Account Frozen", [
         field(E_PHONE, "Account", esc(label)),
         f"{E_WARN} {S('Telegram refuses joins and reactions from it.')}",
@@ -2282,7 +2321,7 @@ async def auto_dead_cleanup_task():
         await asyncio.sleep(60)
         try:
             sweep_counter += 1
-            if sweep_counter >= 30:
+            if sweep_counter >= 15:
                 sweep_counter = 0
                 try:
                     await scan_dead_accounts()
@@ -2290,14 +2329,14 @@ async def auto_dead_cleanup_task():
                     logger.debug("periodic scan_dead_accounts: %s", exc)
 
             dead = list(dead_keys())
+            for k in dead:
+                await purge_dead_account(k)
             stems = list(dead_problem_stems())
+            for s in stems:
+                await purge_dead_account(s, s)
             if dead or stems:
-                logger.info("auto-purging %s registered dead account(s) and %s dead file(s)",
+                logger.info("auto-purged %s registered dead account(s) and %s dead file(s)",
                             len(dead), len(stems))
-                for k in dead:
-                    await purge_dead_account(k)
-                for s in stems:
-                    await purge_dead_account(s, s)
                 if sharding_runtime_enabled():
                     await reconcile_account_shards()
                 await setup_channel_monitors()
@@ -2489,20 +2528,21 @@ async def probe_and_register(session_path: str) -> Tuple[str, Optional[Account]]
             client = TelegramClient(
                 os.path.splitext(session_path)[0], api_id, api_hash, **device
             )
-            await client.connect()
+            await asyncio.wait_for(client.connect(), timeout=SESSION_PROBE_TIMEOUT)
             # is_user_authorized() only means "a call that needs auth failed" and
             # swallows the reason, so ask the server once instead: get_me()
             # answers None for a login Telegram no longer recognises (deleted,
             # banned, key revoked, session terminated) and raises for everything
             # else. A blip therefore lands in "unknown", never in "dead".
-            me = await client.get_me()
-            if me is None:
+            me = await asyncio.wait_for(client.get_me(), timeout=SESSION_PROBE_TIMEOUT)
+            if me is None or getattr(me, "deleted", False):
                 await client.disconnect()
                 acc.state = "dead"
+                reason = "account deleted" if me is not None else "not authorised"
                 # A file that stopped authorising must also stop the client that
                 # an earlier load left registered and running.
-                await detach_dead_by_stem(stem, "not authorised")
-                PROBLEM_SESSIONS[stem] = "dead — not authorised"
+                await detach_dead_by_stem(stem, reason)
+                PROBLEM_SESSIONS[stem] = f"dead — {reason}"
                 return "dead", acc
 
             acc.client = client
@@ -2571,6 +2611,10 @@ async def probe_and_register(session_path: str) -> Tuple[str, Optional[Account]]
                 await detach_dead_by_stem(stem, short_error(e))
                 PROBLEM_SESSIONS[stem] = f"dead — {short_error(e)}"[:90]
                 return "dead", acc
+            if is_frozen_account_error(e):
+                logger.warning(f"{stem}: frozen ({short_error(e)})")
+                PROBLEM_SESSIONS[stem] = f"frozen — {short_error(e)}"[:90]
+                return "unknown", acc
             logger.error(f"{stem}: {type(e).__name__}: {e}")
             PROBLEM_SESSIONS[stem] = f"{type(e).__name__}"
             return "unknown", acc
@@ -2650,7 +2694,16 @@ async def load_all_sessions(progress=None) -> dict:
 
     async def one(path):
         async with sem:
-            state, _ = await probe_and_register(path)
+            try:
+                state, _ = await asyncio.wait_for(
+                    probe_and_register(path),
+                    timeout=SESSION_PROBE_TIMEOUT + 15,
+                )
+            except asyncio.TimeoutError:
+                stem = os.path.splitext(os.path.basename(path))[0]
+                logger.warning("%s: probe timed out during startup", stem)
+                PROBLEM_SESSIONS[stem] = "timeout"
+                state = "unknown"
             tally[state] += 1
             await asyncio.sleep(random.uniform(0.05, 0.25))
 
@@ -2744,8 +2797,8 @@ async def check_account_health(key: str) -> str:
             return "frozen"
         logger.debug(f"health {key}: {type(e).__name__}: {e}")
         return "unclear"
-    if me is None:
-        await mark_dead(key, "login no longer authorised")
+    if me is None or getattr(me, "deleted", False):
+        await mark_dead(key, "account deleted" if me is not None else "login no longer authorised")
         return "dead"
     return "ok"
 
@@ -2760,30 +2813,33 @@ async def keep_alive_task():
     """
     while True:
         await asyncio.sleep(KEEP_ALIVE_INTERVAL)
-        keys = acc_keys()
-        random.shuffle(keys)
-        probing = set(keys[:HEALTH_PROBE_PER_CYCLE])
-        for key in keys:
-            client = acc_client(key)
-            if not client:
-                continue
-            try:
-                if key in probing:
-                    if await check_account_health(key) == "dead":
-                        await asyncio.sleep(random.uniform(0.2, 0.8))
-                        continue
-                await client(UpdateStatusRequest(offline=False))
-            except Exception as e:
-                if is_db_locked(e):
-                    pass
-                elif is_dead_account_error(e):
-                    logger.warning(f"{key} reported dead by Telegram: {e}")
-                    await mark_dead(key, short_error(e))
-                elif is_frozen_account_error(e):
-                    mark_frozen(key, short_error(e))
-                else:
-                    logger.debug(f"keepalive {key}: {type(e).__name__}: {e}")
-            await asyncio.sleep(random.uniform(0.2, 0.8))
+        try:
+            keys = usable_keys()
+            random.shuffle(keys)
+            probing = set(keys[:HEALTH_PROBE_PER_CYCLE])
+            for key in keys:
+                client = acc_client(key)
+                if not client:
+                    continue
+                try:
+                    if key in probing:
+                        if await check_account_health(key) == "dead":
+                            await asyncio.sleep(random.uniform(0.2, 0.8))
+                            continue
+                    await client(UpdateStatusRequest(offline=False))
+                except Exception as e:
+                    if is_db_locked(e):
+                        pass
+                    elif is_dead_account_error(e):
+                        logger.warning(f"{key} reported dead by Telegram: {e}")
+                        await mark_dead(key, short_error(e))
+                    elif is_frozen_account_error(e):
+                        mark_frozen(key, short_error(e))
+                    else:
+                        logger.debug(f"keepalive {key}: {type(e).__name__}: {e}")
+                await asyncio.sleep(random.uniform(0.2, 0.8))
+        except Exception as exc:
+            logger.error("keep_alive_task error: %s", exc)
 
 
 # ═══════════════════════ HISTORY / APPROVAL ═══════════════════════
@@ -3004,7 +3060,7 @@ async def account_load() -> Dict[str, int]:
     Every account starts at 0; the ones that never got picked stay there, which
     is exactly what the balancer needs to see.
     """
-    load = {k: 0 for k in acc_keys()}
+    load = {k: 0 for k in usable_keys()}
     async for d in col_clients.find({"status": {"$ne": "expired"}},
                                     {"joined_accounts": 1}):
         for k in d.get("joined_accounts", []) or []:
@@ -3573,6 +3629,8 @@ async def resolve_peer(key: str, client: TelegramClient, spec):
     for; a fresh session has none, which surfaces as PEER_ID_INVALID even though
     the account is a member. One dialog sweep fixes that.
     """
+    if client is None:
+        return None
     cache_key = (key, str(spec))
     if cache_key in PEER_CACHE:
         return PEER_CACHE[cache_key]
@@ -4003,7 +4061,7 @@ async def execute_leave_specific(event, link: str):
         return await event.respond(card(E_CROSS, "Invalid Link",
                                         [S("Send a channel link or @username.")]),
                                    buttons=kb_nav())
-    keys = acc_keys()
+    keys = usable_keys()
     msg = await event.respond(card(E_TRASH, "Leaving Channel",
                                     [field(E_CHANNEL, "Target", esc(link[:50]))]))
     prog = Progress(msg)
@@ -4019,7 +4077,8 @@ async def execute_leave_specific(event, link: str):
                 ent = await client.get_entity(link)
                 await client.delete_dialog(ent)
             left += 1
-        except Exception:
+        except Exception as e:
+            await note_account_error(key, e)
             failed += 1
         await asyncio.sleep(0.3)
         await prog.show(progress_card("Leaving", i, len(keys), [
@@ -4038,7 +4097,7 @@ async def execute_leave_specific(event, link: str):
 
 
 async def execute_leave_all(event):
-    keys = acc_keys()
+    keys = usable_keys()
     msg = await event.respond(card(E_WARN, "Leaving All Chats",
                                     [S("This cannot be undone.")]))
     prog = Progress(msg)
@@ -4054,10 +4113,10 @@ async def execute_leave_all(event):
                         await client.delete_dialog(dialog.entity)
                         total += 1
                         await asyncio.sleep(0.3)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+                    except Exception as e:
+                        await note_account_error(key, e)
+        except Exception as e:
+            await note_account_error(key, e)
         await prog.show(progress_card("Leaving All", i, len(keys),
                                       [field(E_CHECK, "Chats left", str(total))]))
     invalidate_peer_cache()
@@ -4308,12 +4367,15 @@ async def process_new_post(channel_id: int, message_id: int):
 
         emoji_plan = []
         if react_keys:
-            probe = react_keys[0]
+            probe = next((k for k in react_keys if account_usable(k)), None)
+            if probe is None:
+                probe = next((k for k in local_joined if account_usable(k)), None)
             allowed = None
-            probe_peer = await resolve_peer(probe, acc_client(probe), spec)
-            if probe_peer is not None:
-                allowed = await get_allowed_reactions(probe, acc_client(probe),
-                                                      probe_peer)
+            if probe is not None:
+                probe_peer = await resolve_peer(probe, acc_client(probe), spec)
+                if probe_peer is not None:
+                    allowed = await get_allowed_reactions(probe, acc_client(probe),
+                                                          probe_peer)
             global_plan = []
             for emoji, count in distribute_reactions(n_react, allowed).items():
                 global_plan.extend([emoji] * count)
@@ -4602,10 +4664,10 @@ def ordered_live_account_keys() -> List[str]:
     """Stable account-ID order used by both the bot picker and web panel."""
     if sharding_runtime_enabled() and ACCOUNT_SLOT_BY_KEY:
         return sorted(
-            ACCOUNT_SLOT_BY_KEY,
+            [k for k in ACCOUNT_SLOT_BY_KEY if not account_known_dead(k) and not is_frozen(k)],
             key=lambda key: (ACCOUNT_SLOT_BY_KEY.get(key, 10**9), str(key)),
         )
-    return sorted(acc_keys())
+    return sorted(usable_keys())
 
 
 async def live_selection_candidates() -> List[str]:
@@ -5129,7 +5191,9 @@ async def get_active_call(channel_id: int, keys=None):
     shuffled: always asking the same one would put every one of those requests
     on a single account and eventually earn it a flood wait.
     """
-    pool = list(keys or usable_keys())
+    pool = list(usable_keys() if keys is None else keys)
+    if not pool:
+        return None
     random.shuffle(pool)
     for key in pool:
         if not account_usable(key):
@@ -5143,7 +5207,8 @@ async def get_active_call(channel_id: int, keys=None):
                 continue
             full = await client(GetFullChannelRequest(peer))
             return full.full_chat.call
-        except Exception:
+        except Exception as e:
+            await note_account_error(key, e)
             continue
     return None
 
@@ -5166,6 +5231,8 @@ async def livestream_watch_task():
                         pool.append(k)
 
             for chat_id, keys in targets.items():
+                if not keys:
+                    continue
                 call = await get_active_call(chat_id, keys)
                 if call is None:
                     active_calls.pop(chat_id, None)
@@ -6271,11 +6338,14 @@ async def route_callback(event, uid, owner, data):
         # callback must still be answered before any network operation.
         await safe_callback_answer(event, "Deleting all account sessions...")
         try:
-            # Disconnect any account that survived the scan before deleting its
-            # local/remote session file.
-            for key in list(acc_keys()):
-                await disconnect_account(key)
             problem_stems = list(PROBLEM_SESSIONS)
+            problem_stem_set = set(problem_stems)
+            # Disconnect only accounts whose session is in Needs Review (or already dead),
+            # never healthy accounts.
+            for key, acc in list(ACCOUNTS.items()):
+                if acc.stem in problem_stem_set or acc.state == "dead":
+                    await disconnect_account(key)
+                    ACCOUNTS.pop(key, None)
             result = await move_problem_session_storage_to_trash(problem_stems)
             PROBLEM_SESSIONS.clear()
             invalidate_peer_cache()
@@ -8624,7 +8694,7 @@ async def handle_zip_import(event):
             await restore_runtime_storage(force=False)
             await prune_local_sessions_not_owned()
             await load_all_sessions()
-            new_keys = list(acc_keys())
+            new_keys = list(usable_keys())
 
         await setup_channel_monitors()
         # Every account that came in from this ZIP now walks into all the
@@ -8721,13 +8791,13 @@ async def main():
     tally = await load_all_sessions()
     # Auto-purge any accounts detected as dead on startup so workers don't carry dead weight
     dead_boot = list(dead_keys())
+    for k in dead_boot:
+        await purge_dead_account(k)
     stems_boot = list(dead_problem_stems())
+    for s in stems_boot:
+        await purge_dead_account(s, s)
     if dead_boot or stems_boot:
-        print(f"  purging dead : {len(dead_boot)} account(s) moved to trash on boot")
-        for k in dead_boot:
-            await purge_dead_account(k)
-        for s in stems_boot:
-            await purge_dead_account(s, s)
+        print(f"  purging dead : {len(dead_boot) + len(stems_boot)} account(s) moved to trash on boot")
         if sharding_runtime_enabled():
             await reconcile_account_shards()
     # Persist metadata written during the probe before any worker starts.
@@ -8746,7 +8816,7 @@ async def main():
     if IS_CONTROLLER_WORKER:
         asyncio.create_task(reminder_task())
         asyncio.create_task(expiry_check_task())
-        asyncio.create_task(auto_dead_cleanup_task())
+    asyncio.create_task(auto_dead_cleanup_task())
     asyncio.create_task(keep_alive_task())
     asyncio.create_task(onboard_sweep_task())
     asyncio.create_task(dashboard_task_worker())
